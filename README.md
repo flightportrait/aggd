@@ -47,7 +47,7 @@ and ignored. `Dockerfile` and `deploy/aggd.service` are there to start from.
 | Out, streams | Beast full, Beast reduced, Beast reduced with receiver ids (MLAT results included with `--forward-mlat`), BaseStation (optionally rate-limited, optionally with MLAT), BaseStation JAERO only, JSON position lines; each as a listener or an outbound connector |
 | Out, HTTP | `aircraft.json`, `receiver.json`, `clients.json`, `receivers.json`, `stats.json`, `status.json`, `aircraft.binCraft[.zst]`, `globe_N.binCraft[.zst]`, `globeMil_N…`, `traces/xx/trace_{full,recent}_HEX.json`, `/globe_history/…`, `/metrics` (Prometheus), and the re-api queries: `all`, `circle`, `closest`, `box`, `find_hex`, `find_callsign`, `find_reg`, `find_type` (combinable, as tar1090 does), the `filter_*` set, `jv2`, `binCraft`, `zstd` |
 | Web | `--web-root DIR` serves a directory beside the data. With tar1090's html directory aggd is the whole map server: no nginx, nothing written to a tmpfs |
-| Kept | per-day trace files in tar1090's `globe_history` layout; traces across restarts; heat map files (`--heatmap N`) |
+| Kept | per-day trace files in tar1090's `globe_history` layout; traces across restarts; heat map files (`--heatmap N`); with `--write-traces`, each aircraft's live trace files beside the `--write-json` files, as readsb keeps them |
 | Decoded | DF0/4/5/11/16/17/18/20/21; ADS-B versions 0–2 (identification, surface and airborne position, velocity, emergency, ACAS advisories, target state, operational status), TIS-B and ADS-R; Comm-B registers 2,0 3,0 4,0 5,0 6,0 |
 | Derived | true heading from magnetic (WMM2025), wind, outside and total temperature, track from positions, airframe registration/type/flags from a tar1090-db file, military address blocks, round-trip time to each feeder |
 
@@ -118,7 +118,9 @@ floods below the rate limits from many addresses.
 - Nothing is written to be served. readsb rewrites `aircraft.json`, every
   globe tile and the traces to a tmpfs every second whether or not anyone
   is looking. aggd renders a document when it is asked for and keeps it
-  for one refresh interval.
+  for one refresh interval. (`--write-traces` writes the trace files
+  anyway, for readers of readsb's files on disk: only an aircraft's
+  that has grown, and never the globe tiles.)
 - A transmission heard by fifteen receivers is decoded once. The other
   fourteen copies match a short per-aircraft list of recent frames.
 - Memory follows the aircraft in the air, not the day's traffic. A day
@@ -401,6 +403,16 @@ On the recorded traffic, in rough order of how often:
   aircraft on the ground, which readsb does not. It was checked with
   frames built from the standard's layout (`tools/uat_probe.py`), sent to
   both; no recorded UAT traffic was available.
+- Trace files on disk (`--write-traces`): readsb's `trace_recent` is
+  rewritten about every 4 s while the aircraft adds points, as aggd's
+  is; it holds 92 points where aggd's holds the 142 the HTTP server
+  serves. readsb rewrites `trace_full` on a cycle that lengthens with
+  the table (about 2 minutes at 300 aircraft, a median of 8 at 15,000);
+  aggd rewrites it once it lacks half of what `trace_recent` holds, and
+  at least every five minutes while it grows, so the two files together
+  always hold the whole trace. readsb leaves the files of aircraft it no
+  longer keeps; aggd removes them as their traces age out, and at start
+  those of aircraft it did not restore.
 - Not present: raw/ASTERIX/Kinetic/VRS formats, the range outline,
   `globeRates.json`, tar1090's `chunks/` history (traces are used
   instead), Comm-B registers beyond 2,0 3,0 4,0 5,0 6,0.

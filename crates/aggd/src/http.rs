@@ -251,17 +251,7 @@ fn static_file(ctx: &Ctx, path: &str, enc: Enc) -> Option<Resp> {
 
 /// /traces/<last two hex digits>/trace_(full|recent)_<hex>.json
 fn trace(ctx: &Ctx, p: &str, enc: Enc) -> Option<Resp> {
-    let name = p.strip_prefix("/traces/")?.split('/').nth(1)?;
-    let name = name.strip_suffix(".json")?;
-    let (recent, hexs) = match name.strip_prefix("trace_recent_") {
-        Some(h) => (true, h),
-        None => (false, name.strip_prefix("trace_full_")?),
-    };
-    let (hexs, flag) = match hexs.strip_prefix('~') {
-        Some(h) => (h, modes::NON_ICAO),
-        None => (hexs, 0),
-    };
-    let addr = u32::from_str_radix(hexs, 16).ok()? | flag;
+    let (recent, addr) = crate::trace::file_addr(p.strip_prefix("/traces/")?.split('/').nth(1)?)?;
     let mut out = String::new();
     {
         let s = ctx.store.shard(addr).lock();
@@ -270,9 +260,8 @@ fn trace(ctx: &Ctx, p: &str, enc: Enc) -> Option<Resp> {
             Some(a) => (&a.trace, a.db.clone()),
             None => (&s.gone.get(&addr)?.trace, ctx.db.as_ref().and_then(|d| d.describe(addr))),
         };
-        let (pts, details) = trace.all();
-        let from = if recent { pts.len().saturating_sub(ctx.cfg.trace_recent_points) } else { 0 };
-        crate::trace::render(addr, db.as_deref(), &pts[from..], &details, &mut out);
+        let (pts, details) = if recent { trace.last(ctx.cfg.trace_recent_points) } else { trace.all() };
+        crate::trace::render(addr, db.as_deref(), &pts, &details, &mut out);
     }
     Some(dynamic(out.into_bytes(), "application/json", enc))
 }

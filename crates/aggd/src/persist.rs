@@ -79,6 +79,134 @@ pub fn write_history(ctx: &Ctx, dir: &str, from: usize, to: usize) -> usize {
     files
 }
 
+/// Seconds in which every aircraft's trace_recent file is looked at once:
+/// readsb's are rewritten about every 4 s while the aircraft adds points.
+pub const TRACE_PASS_S: u64 = 4;
+// each pass takes an equal share of the shards
+const _: () = assert!(crate::track::SHARDS % TRACE_PASS_S as usize == 0);
+/// trace_full is rewritten once it lacks half the points trace_recent
+/// holds, so that the two together always have the whole trace, and at
+/// least this often while the trace grows.
+const FULL_EVERY: Ms = 5 * 60_000;
+/// Rendered documents held before the shard is let go and they are written.
+const TRACE_BATCH_BYTES: usize = 4 << 20;
+
+/// The live trace files beside aircraft.json, for whatever reads
+/// readsb's from disk: traces/<last two hex digits>/trace_recent_<hex>.json
+/// with the newest points and trace_full_<hex>.json with all of them,
+/// gzipped, as the HTTP server serves them. Writes those of aircraft in
+/// shards `from..to` whose trace has grown since; returns how many were
+/// written and how many could not be.
+pub fn write_traces(ctx: &Ctx, dir: &str, from: usize, to: usize) -> (usize, usize) {
+    let n_recent = ctx.cfg.trace_recent_points;
+    let (mut files, mut failed) = (0, 0);
+    for s in &ctx.store.shards()[from..to] {
+        // what needs writing, then a batch at a time: rendered whole, a
+        // day of traces (a restart, all of them at once) would be held
+        // in memory together
+        let mut due: Vec<(u32, bool, bool)> = Vec::new();
+        {
+            let s = s.lock();
+            let live = s.map.values().map(|a| (a.addr, &a.trace));
+            for (addr, trace) in live.chain(s.gone.iter().map(|(addr, g)| (*addr, &g.trace))) {
+                let Some(last) = trace.last_point().map(|p| p.t()) else { continue };
+                let f = trace.files.as_deref().copied().unwrap_or_default();
+                let recent = last > f.recent;
+                let full = last > f.full
+                    && (f.full == 0 || trace.len().saturating_sub(f.full_len) * 2 >= n_recent || last >= f.full + FULL_EVERY);
+                if recent || full {
+                    due.push((addr, recent, full));
+                }
+            }
+        }
+        let mut due = due.into_iter().peekable();
+        while due.peek().is_some() {
+            let mut jobs: Vec<(String, String)> = Vec::new();
+            let mut bytes = 0;
+            {
+                let mut s = s.lock();
+                let s = &mut *s;
+                for (addr, recent, full) in due.by_ref() {
+                    let (db, trace) = match s.map.get_mut(&addr) {
+                        Some(a) => (a.db.clone(), &mut a.trace),
+                        None => match s.gone.get_mut(&addr) {
+                            Some(g) => (None, &mut g.trace),
+                            None => continue,
+                        },
+                    };
+                    let Some(last) = trace.last_point().map(|p| p.t()) else { continue };
+                    let db = db.or_else(|| ctx.db.as_ref().and_then(|d| d.describe(addr)));
+                    let hex = crate::json::hex(addr);
+                    let sub = format!("{dir}/traces/{}", &hex[hex.len() - 2..]);
+                    for (kind, wanted) in [("recent", recent), ("full", full)] {
+                        if !wanted {
+                            continue;
+                        }
+                        let (points, details) = if kind == "recent" { trace.last(n_recent) } else { trace.all() };
+                        let mut body = String::with_capacity(points.len() * 70 + 256);
+                        trace::render(addr, db.as_deref(), &points, &details, &mut body);
+                        bytes += body.len();
+                        jobs.push((format!("{sub}/trace_{kind}_{hex}.json"), body));
+                    }
+                    let len = trace.len();
+                    let f = trace.files.get_or_insert_with(Default::default);
+                    if recent {
+                        f.recent = last;
+                    }
+                    if full {
+                        (f.full, f.full_len) = (last, len);
+                    }
+                    if bytes >= TRACE_BATCH_BYTES {
+                        break;
+                    }
+                }
+            }
+            for (path, body) in jobs {
+                // readsb's are gzipped at its fastest setting
+                let mut e = flate2::write::GzEncoder::new(Vec::with_capacity(body.len() / 5), flate2::Compression::fast());
+                let _ = e.write_all(body.as_bytes());
+                let Ok(gz) = e.finish() else { continue };
+                let (parent, name) = path.rsplit_once('/').unwrap_or((".", &path));
+                let tmp = format!("{parent}/.{name}.tmp");
+                if std::fs::write(&tmp, gz).is_ok() && std::fs::rename(&tmp, &path).is_ok() {
+                    files += 1;
+                } else {
+                    let _ = std::fs::remove_file(&tmp);
+                    failed += 1;
+                }
+            }
+        }
+    }
+    (files, failed)
+}
+
+/// Remove the trace files of aircraft no longer kept (their trace has
+/// aged out, or they are from an earlier run that kept no state) and
+/// files left half-written. Run between passes of `write_traces`, never
+/// beside one. Returns how many went.
+pub fn sweep_traces(ctx: &Ctx, dir: &str) -> usize {
+    let mut removed = 0;
+    for i in 0..256 {
+        let Ok(entries) = std::fs::read_dir(format!("{dir}/traces/{i:02x}")) else { continue };
+        for e in entries.flatten() {
+            let name = e.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let keep = match trace::file_addr(name) {
+                Some((_, addr)) => {
+                    let s = ctx.store.shard(addr).lock();
+                    s.map.contains_key(&addr) || s.gone.contains_key(&addr)
+                }
+                // ours, from a write cut short; anything else is left alone
+                None => !(name.starts_with(".trace_") && name.ends_with(".tmp")),
+            };
+            if !keep && std::fs::remove_file(e.path()).is_ok() {
+                removed += 1;
+            }
+        }
+    }
+    removed
+}
+
 const MAGIC: &[u8; 8] = b"aggdst01";
 const POINT: usize = 36;
 

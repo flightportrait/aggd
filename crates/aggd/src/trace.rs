@@ -186,6 +186,34 @@ pub struct Trace {
     cold: Vec<Cold>,
     /// the last point and detail packed away, for when nothing is open
     tail: Option<Box<(Packed, Option<Detail>)>>,
+    /// what is in its trace files on disk (--write-traces); absent until
+    /// they are first written
+    pub files: Option<Box<Files>>,
+}
+
+/// The newest point in each of an aircraft's trace files on disk, and
+/// the length of the trace when trace_full was written.
+#[derive(Clone, Copy, Default)]
+pub struct Files {
+    pub recent: Ms,
+    pub full: Ms,
+    pub full_len: usize,
+}
+
+/// The aircraft a trace file is for, and whether it is trace_recent:
+/// trace_(full|recent)_<hex>.json, `~` before the hex of an address
+/// that is not an ICAO one.
+pub fn file_addr(name: &str) -> Option<(bool, u32)> {
+    let name = name.strip_suffix(".json")?;
+    let (recent, hexs) = match name.strip_prefix("trace_recent_") {
+        Some(h) => (true, h),
+        None => (false, name.strip_prefix("trace_full_")?),
+    };
+    let (hexs, flag) = match hexs.strip_prefix('~') {
+        Some(h) => (h, modes::NON_ICAO),
+        None => (hexs, 0),
+    };
+    Some((recent, u32::from_str_radix(hexs, 16).ok()? | flag))
 }
 
 struct Cold {
@@ -366,6 +394,30 @@ impl Trace {
         }
         p.extend_from_slice(&self.points);
         d.extend_from_slice(&self.details);
+        (Cow::Owned(p), Cow::Owned(d))
+    }
+
+    /// The newest `n` points (all of them in a shorter trace) and the
+    /// details that go with them, unpacking only the chunks they are in:
+    /// a recent trace is asked for far more often than a day of one.
+    pub fn last(&self, n: usize) -> (std::borrow::Cow<'_, [Packed]>, std::borrow::Cow<'_, [Detail]>) {
+        use std::borrow::Cow;
+        let open = self.points.len();
+        if open >= n || self.cold.is_empty() {
+            return (Cow::Borrowed(&self.points[open.saturating_sub(n)..]), Cow::Borrowed(&self.details));
+        }
+        let (mut first, mut have) = (self.cold.len(), open);
+        while first > 0 && have < n {
+            first -= 1;
+            have += self.cold[first].points as usize;
+        }
+        let (mut p, mut d) = (Vec::with_capacity(have), Vec::new());
+        for c in &self.cold[first..] {
+            c.unpack(&mut p, &mut d);
+        }
+        p.extend_from_slice(&self.points);
+        d.extend_from_slice(&self.details);
+        p.drain(..p.len().saturating_sub(n));
         (Cow::Owned(p), Cow::Owned(d))
     }
 
@@ -826,5 +878,51 @@ mod cold_tests {
         let mut e = Trace::default();
         e.compact(0);
         assert!(e.is_empty() && e.first_t().is_none() && e.last_point().is_none() && e.trim_before(5) == 0);
+    }
+
+    /// The newest points, taken without unpacking the whole trace, are
+    /// the end of the whole trace, and render to the same document.
+    #[test]
+    fn the_newest_points_are_the_end_of_the_trace() {
+        let render_tail = |t: &Trace, n: usize| {
+            let (p, d) = t.all();
+            let mut out = String::new();
+            render(0x4ca123, None, &p[p.len().saturating_sub(n)..], &d, &mut out);
+            out
+        };
+        let render_last = |t: &Trace, n: usize| {
+            let (p, d) = t.last(n);
+            let mut out = String::new();
+            render(0x4ca123, None, &p, &d, &mut out);
+            (p.len(), out)
+        };
+        let mut t = Trace::default();
+        for i in 0..700u32 {
+            t.points.push(point(i));
+            if i % 6 == 0 {
+                t.details.push(detail(i));
+            }
+            t.tidy();
+            if i % 37 == 0 || i == 699 {
+                // open points only, a chunk and a part, several chunks, all
+                for n in [1, 20, 142, 300, 2000] {
+                    let (len, doc) = render_last(&t, n);
+                    assert_eq!(len, n.min(i as usize + 1), "{i} {n}");
+                    assert_eq!(doc, render_tail(&t, n), "{i} {n}");
+                }
+            }
+        }
+        // silent, nothing open
+        t.compact(0);
+        assert_eq!(render_last(&t, 142), (142, render_tail(&t, 142)));
+        assert_eq!(render_last(&Trace::default(), 142).0, 0);
+    }
+
+    #[test]
+    fn trace_file_names() {
+        assert_eq!(file_addr("trace_recent_4ca123.json"), Some((true, 0x4ca123)));
+        assert_eq!(file_addr("trace_full_~0abc12.json"), Some((false, 0x0abc12 | modes::NON_ICAO)));
+        assert_eq!(file_addr(".trace_full_4ca123.json.tmp"), None);
+        assert_eq!(file_addr("trace_full_zz.json"), None);
     }
 }
