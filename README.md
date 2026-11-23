@@ -266,9 +266,10 @@ files, while aggd always keeps a day of traces and writes the history.
 A second readsb started on the same stream with what a tar1090
 aggregator runs (`--write-json-globe-index --write-globe-history
 --heatmap 30`) held 82 MB a minute after starting, with no history yet,
-and 103 MB after 45 minutes, and used 36,600 CPU ticks an hour where
-aggd used 1,010 and the bare readsb 1,860. That is one night-time
-window of 45 minutes; a day of it has not been measured.
+and 124 MB after three hours, still rising by about 10 MB an hour, and
+used 37,800 CPU ticks an hour (a tenth of a core) where aggd used 1,040
+and the bare readsb 1,900. Those are three night-time hours with about
+300 aircraft in the air; a day of it has not been measured.
 
 Real traffic is where the rules that no standard states show up, and
 most of the work was finding them, one experiment at a time, with
@@ -366,6 +367,20 @@ On the recorded traffic, in rough order of how often:
 - `calc_track` and the DF18 non-transponder position noted in the probe.
 - BaseStation output carries each transmission once, not once per receiver
   that heard it.
+- MLAT and ADS-C beside direct reception (`tools/src_probe.py`): an
+  aircraft's own position always wins, MLAT replaces it after 15 s of
+  silence, and an ADS-C report places only an aircraft that has had no
+  other position for five minutes, all as measured on readsb; 14 of the
+  16 histories agree. The two that do not are when an aircraft with
+  ADS-C reports waiting, and no position, is called `adsc`: readsb's
+  own answer moved between runs (102 s and 146 s after the same input).
+- The reduced Beast stream carries frames unaltered, with the receiver's
+  timestamp and signal as readsb's does, but chooses differently which
+  to keep: of 1,296 frames, readsb's kept 833 and aggd's 720, 612 of
+  them the same. The full stream was identical, all 1,296
+  (`tools/beast_out_probe.py`). readsb also sends an empty Mode A/C
+  frame as a keep-alive every few seconds; aggd sends one only after
+  30 s of silence.
 - `stats.json` has every key readsb has, but the CPR and CPU breakdowns are
   zero or approximate.
 - Mode A/C: `--modeac` is accepted and, as with readsb on an aggregator,
@@ -396,6 +411,12 @@ reading its flag back, `tools/milranges.py`), and the World Magnetic Model
 coefficients in `wmm_data.rs` (NOAA, public domain).
 
 ## Tools
+
+- `tools/src_probe.py`: sixteen short histories of an aircraft heard
+  directly, placed by MLAT and reported over ADS-C in turn, played to
+  readsb and aggd, with when each changes what it shows.
+  `tools/beast_out_probe.py`: the same frames into both, their Beast
+  outputs compared frame by frame.
 
 - `tools/check.sh [quick]`: unit tests, malformed input, hostile
   receivers, readsb side by side; start here.

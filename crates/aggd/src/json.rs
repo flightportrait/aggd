@@ -54,10 +54,12 @@ pub fn nav_modes(o: &mut String, m: u8) {
 
 /// The value readsb puts in "type": where the best current data came from.
 pub fn type_str(a: &Aircraft, now: Ms) -> &'static str {
+    // still that kind: placed that way lately, or heard no other way since
+    let still = |ttl: Ms| now.saturating_sub(a.addr_type_t) <= ttl || a.direct <= a.addr_type_t;
     if a.pos.valid(now) {
         match a.pos.src {
-            Source::Mlat => return "mlat",
-            Source::Jaero => return "adsc",
+            Source::Mlat if a.addr_type == AddrType::Mlat && still(crate::track::MLAT_TYPE_TTL) => return "mlat",
+            Source::Jaero if a.addr_type == AddrType::Jaero && still(crate::track::JAERO_TYPE_TTL) => return "adsc",
             Source::Sbs | Source::Prio => return "other",
             _ => {}
         }
@@ -68,6 +70,8 @@ pub fn type_str(a: &Aircraft, now: Ms) -> &'static str {
         // set by a message: an extended squitter that is nobody's own
         AddrType::Unknown if a.addr_type_t != 0 && now.saturating_sub(a.es_seen) <= crate::track::ES_TTL => "unknown",
         AddrType::Unknown | AddrType::ModeS => "mode_s",
+        // known from ADS-C reports that do not place it yet
+        AddrType::Jaero if !a.pos.valid(now) && still(crate::track::JAERO_TYPE_TTL) => "adsc",
         t if t <= AddrType::TisbOther && t != AddrType::Jaero && t != AddrType::Mlat && t != AddrType::Other => {
             let own = matches!(t, AddrType::AdsbIcao);
             if if own { a.adsb_pos != 0 } else { now.saturating_sub(a.es_seen) <= crate::track::ES_TTL } {
@@ -458,7 +462,9 @@ pub fn aircraft_json(store: &Store, v: &View<'_>, window: Ms) -> String {
 #[inline]
 pub fn listed(a: &Aircraft, now: Ms, window: Ms) -> bool {
     // one message alone is as likely noise as an aircraft
-    (a.messages >= 2 && now.saturating_sub(a.checked) <= window) || (a.pos.src == Source::Jaero && a.pos.valid(now))
+    // (a position solved elsewhere is not noise: readsb lists an aircraft
+    // on its first MLAT result or ADS-C report)
+    (a.messages >= 2 && now.saturating_sub(a.checked) <= window) || (matches!(a.pos.src, Source::Jaero | Source::Mlat) && a.pos.valid(now))
 }
 
 #[cfg(test)]

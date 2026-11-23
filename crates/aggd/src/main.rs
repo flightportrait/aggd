@@ -474,11 +474,10 @@ impl Ctx {
     }
 }
 
-fn write_atomic(dir: &str, name: &str, body: &str) {
+fn write_atomic(dir: &str, name: &str, body: &str) -> std::io::Result<()> {
     let tmp = format!("{dir}/.{name}.tmp");
-    if std::fs::write(&tmp, body).is_ok() {
-        let _ = std::fs::rename(&tmp, format!("{dir}/{name}"));
-    }
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(&tmp, format!("{dir}/{name}"))
 }
 
 fn main() -> anyhow::Result<()> {
@@ -598,7 +597,6 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 
     // housekeeping, once a second
     let hk = ctx.clone();
-    let json_dir = cli.write_json.clone();
     let (hist_dir, state_dir) = (cli.write_globe_history.clone(), cli.write_state.clone());
     let heat_dir = cli.heatmap_dir.clone().or_else(|| cli.write_globe_history.clone());
     tune_allocator();
@@ -654,20 +652,48 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                     .await;
                 }
             }
-            if let Some(dir) = &json_dir {
-                let (c, dir) = (hk.clone(), dir.clone());
-                let _ = tokio::task::spawn_blocking(move || {
-                    write_atomic(&dir, "aircraft.json", &json::aircraft_json(&c.store, &c.view(now), c.cfg.list_window_ms));
-                    write_atomic(&dir, "clients.json", &c.reg.clients_json(now));
-                    write_atomic(&dir, "receivers.json", &c.reg.receivers_json(now));
-                    write_atomic(&dir, "stats.json", &c.stats_json(now));
-                    write_atomic(&dir, "status.json", &c.status_json(now));
-                    write_atomic(&dir, "receiver.json", &c.receiver_json());
-                })
-                .await;
-            }
         }
     });
+
+    // the JSON files on disk, for whatever reads them from there
+    if let Some(dir) = cli.write_json.clone() {
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            eprintln!("aggd: --write-json {dir}: {e}");
+        }
+        let c = ctx.clone();
+        let every = Duration::from_millis(c.cfg.json_every_ms);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(every);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut failing = false;
+            loop {
+                tick.tick().await;
+                let (c, dir) = (c.clone(), dir.clone());
+                let res = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+                    let now = now_ms();
+                    write_atomic(&dir, "aircraft.json", &json::aircraft_json(&c.store, &c.view(now), c.cfg.list_window_ms))?;
+                    write_atomic(&dir, "clients.json", &c.reg.clients_json(now))?;
+                    write_atomic(&dir, "receivers.json", &c.reg.receivers_json(now))?;
+                    write_atomic(&dir, "stats.json", &c.stats_json(now))?;
+                    write_atomic(&dir, "status.json", &c.status_json(now))?;
+                    write_atomic(&dir, "receiver.json", &c.receiver_json())
+                })
+                .await;
+                // say so once when it stops working, and once when it works again
+                match res {
+                    Ok(Err(e)) if !failing => {
+                        failing = true;
+                        eprintln!("aggd: --write-json: cannot write: {e}");
+                    }
+                    Ok(Ok(())) if failing => {
+                        failing = false;
+                        eprintln!("aggd: --write-json: writing again");
+                    }
+                    _ => {}
+                }
+            }
+        });
+    }
 
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     tokio::select! {

@@ -810,7 +810,7 @@ pub async fn sbs_ingest(ctx: Arc<Ctx>, s: TcpStream, proto: Proto, local: bool) 
             }
             if a.addr_type == AddrType::Unknown {
                 a.addr_type = e.addr_type.unwrap_or(AddrType::Other);
-                a.addr_type_t = now;
+                a.addr_type_t = wall;
             }
             if track::apply_external(a, &e, now, wall) == Pos::New {
                 ctx.stats.positions.fetch_add(1, Ordering::Relaxed);

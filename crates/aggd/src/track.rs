@@ -24,6 +24,16 @@ pub const LESSER_AFTER: Ms = 15_000;
 pub const ES_TTL: Ms = 90_000;
 /// A lesser source may replace a position once it is this old.
 pub const STALE: Ms = 15_000;
+/// An ADS-C report may replace a position from another source once it
+/// is this old (five minutes, measured on readsb).
+pub const JAERO_AFTER: Ms = 300_000;
+/// An aircraft placed by MLAT or ADS-C and also heard directly is shown
+/// as that kind for this long after the last such position, then as the
+/// Mode S aircraft it is, the position staying (measured on readsb with
+/// tools/src_probe.py: 45 s after the last MLAT result, 91 s after an
+/// ADS-C report; one heard no other way keeps the kind).
+pub const MLAT_TYPE_TTL: Ms = 45_000;
+pub const JAERO_TYPE_TTL: Ms = 90_000;
 /// Even and odd position messages pair up within a window that depends
 /// on how far the aircraft can have gone. Measured on readsb with pairs
 /// a set time apart: half a minute for an aircraft whose ground speed
@@ -194,6 +204,9 @@ pub struct Aircraft {
     pub sil_type: u8,
     /// when an extended squitter was last heard from it
     pub es_seen: Ms,
+    /// when one of its own transmissions last came in through a receiver
+    /// (as opposed to a position solved elsewhere: MLAT, ADS-C)
+    pub direct: Ms,
     /// when it was first heard
     pub created: Ms,
     /// its own squitters currently count it as an ADS-B aircraft: set by a
@@ -338,6 +351,7 @@ impl Aircraft {
             sil: F::default(),
             sil_type: 255,
             es_seen: 0,
+            direct: 0,
             created: now,
             adsb_pos: 0,
             ver_t: 0,
@@ -395,6 +409,7 @@ impl Aircraft {
             if e.0 == key && t.wrapping_sub(e.1) < DUP_WINDOW {
                 let pos = e.2;
                 self.seen = now;
+                self.direct = now;
                 if checked {
                     self.checked = now;
                 }
@@ -647,6 +662,7 @@ pub fn bearing(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
 /// location when it is known, the last resort for surface positions.
 pub fn apply(a: &mut Aircraft, m: &Msg, signal: u8, now: Ms, rx: u64, rx_ref: Option<(f64, f64)>, key: u64) -> Applied {
     a.seen = now;
+    a.direct = now;
     if matches!(m.df, 11 | 17 | 18) {
         a.checked = now;
     }
@@ -929,7 +945,7 @@ pub fn apply(a: &mut Aircraft, m: &Msg, signal: u8, now: Ms, rx: u64, rx_ref: Op
             }
         }
         out.pos = position(a, &c, src, now, rx, rx_ref, key);
-        if out.pos == Pos::New && m.df == 17 {
+        if m.df == 17 && (out.pos == Pos::New || (out.pos == Pos::Duplicate && a.pos.src == Source::Adsb)) {
             a.adsb_pos = now;
         }
         if out.pos == Pos::New {
@@ -1005,6 +1021,14 @@ fn position(a: &mut Aircraft, c: &Cpr, src: Source, now: Ms, rx: u64, rx_ref: Op
         if !a.pos_valid(now) {
             return Pos::None;
         }
+        // An aircraft standing still says the same thing again and
+        // again: it is still there, and its position is as fresh as its
+        // last word (readsb's seen_pos stays near zero for one; left to
+        // age here, a parked aircraft's place went stale and a solved
+        // position from elsewhere took it over).
+        if a.pos.src == src {
+            a.pos.t = now;
+        }
         a.confirm_position(rx, now);
         return Pos::Duplicate;
     }
@@ -1068,7 +1092,12 @@ fn position(a: &mut Aircraft, c: &Cpr, src: Source, now: Ms, rx: u64, rx_ref: Op
     let Some((lat, lon)) = fix else { return Pos::None };
 
     // A position must be reachable from the previous one.
-    if a.pos.src != Source::Invalid && now.saturating_sub(a.pos.t) < 120_000 && a.pos.src >= Source::Mlat {
+    // (One solved elsewhere, by MLAT or from an ADS-C report, is no
+    // measure of that: the aircraft's own word replaces it. Held to a
+    // MLAT result two kilometres off, an aircraft that began sending
+    // ADS-B was refused, lost its place, and was given the MLAT one
+    // back, every few seconds; readsb takes the first ADS-B position.)
+    if a.pos.src != Source::Invalid && now.saturating_sub(a.pos.t) < 120_000 && a.pos.src >= Source::Tisb {
         let dt = now.saturating_sub(a.pos.t) as f64 / 1000.0;
         let speed_kt = match a.gs.get(now) {
             Some(g) => (g as f64 * 1.3).max(if c.surface { 60.0 } else { 200.0 }),
@@ -1309,6 +1338,22 @@ pub fn apply_external(a: &mut Aircraft, e: &External, now: Ms, wall: Ms) -> Pos 
     if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
         return Pos::None;
     }
+    // An ADS-C report is the last resort: readsb takes one for an
+    // aircraft with no place, and for one whose place came from anything
+    // else not until that is long gone (tools/src_probe.py: with ADS-B or
+    // MLAT silent and JAERO lines every 3 s, the first was taken 302 s
+    // and 301 s after the last position; from 90 s on the aircraft was
+    // shown as "adsc" with no position).
+    if src == Source::Jaero && !matches!(a.pos.src, Source::Invalid | Source::Jaero) && wall.saturating_sub(a.pos.t) < JAERO_AFTER {
+        // not placed by it yet, but known by it once nothing else has
+        // said what the aircraft is for a minute and a half
+        let quiet = wall.saturating_sub(a.addr_type_t) > JAERO_TYPE_TTL && wall.saturating_sub(a.es_seen) > ES_TTL;
+        if a.addr_type == AddrType::Jaero || quiet {
+            a.addr_type = AddrType::Jaero;
+            a.addr_type_t = wall;
+        }
+        return Pos::None;
+    }
     if !a.pos.accept_after((lat, lon), src, now, STALE) {
         return Pos::None;
     }
@@ -1318,7 +1363,7 @@ pub fn apply_external(a: &mut Aircraft, e: &External, now: Ms, wall: Ms) -> Pos 
     a.pos_surface = false;
     if let Some(t) = e.addr_type {
         a.addr_type = t;
-        a.addr_type_t = now;
+        a.addr_type_t = wall;
     }
     Pos::New
 }
@@ -1330,6 +1375,7 @@ pub fn apply_external(a: &mut Aircraft, e: &External, now: Ms, wall: Ms) -> Pos 
 pub fn apply_uat(a: &mut Aircraft, u: &modes::uat::Uat, now: Ms) -> Pos {
     let src = if matches!(u.qualifier, 2 | 3) { Source::Tisb } else { Source::Adsr };
     a.seen = now;
+    a.direct = now;
     a.checked = now;
     a.messages = a.messages.wrapping_add(1);
     a.es_seen = now;
@@ -1634,6 +1680,68 @@ mod tests {
         assert_eq!(apply_external(&mut a, &mlat, T0 + 20_000, T0 + 20_000), Pos::New);
         assert_eq!(a.pos.src, Source::Mlat);
         assert_eq!(crate::json::type_str(&a, T0 + 20_000), "mlat");
+    }
+
+    #[test]
+    fn its_own_position_replaces_a_solved_one_at_once() {
+        // placed by MLAT a few kilometres from where it says it is
+        let mut a = Aircraft::new(1, T0);
+        let mlat = External { source: Source::Mlat, pos: Some((45.53, 9.25)), addr_type: Some(modes::AddrType::Mlat), ..Default::default() };
+        assert_eq!(apply_external(&mut a, &mlat, T0, T0), Pos::New);
+        feed(&mut a, &enc::airborne_position(1, 45.5, 9.25, 35000, false, 11), T0 + 1000);
+        feed(&mut a, &enc::airborne_position(1, 45.5, 9.25, 35000, true, 11), T0 + 1400);
+        assert_eq!(a.pos.src, Source::Adsb);
+        assert!((a.pos.v.0 - 45.5).abs() < 1e-3);
+        assert_eq!(crate::json::type_str(&a, T0 + 1400), "adsb_icao");
+    }
+
+    #[test]
+    fn an_adsc_report_does_not_displace_a_live_track() {
+        let jaero = External { source: Source::Jaero, pos: Some((45.52, 9.25)), addr_type: Some(modes::AddrType::Jaero), ..Default::default() };
+        // over ADS-B, fresh or a minute stale
+        let mut a = Aircraft::new(1, T0);
+        feed(&mut a, &enc::airborne_position(1, 45.5, 9.25, 35000, false, 11), T0);
+        feed(&mut a, &enc::airborne_position(1, 45.5, 9.25, 35000, true, 11), T0 + 400);
+        for dt in [2_000, 20_000, 100_000] {
+            assert_eq!(apply_external(&mut a, &jaero, T0 + dt, T0 + dt), Pos::None);
+        }
+        assert_eq!(a.pos.src, Source::Adsb);
+        // over MLAT
+        let mut a = Aircraft::new(2, T0);
+        let mlat = External { source: Source::Mlat, pos: Some((45.5, 9.25)), addr_type: Some(modes::AddrType::Mlat), ..Default::default() };
+        assert_eq!(apply_external(&mut a, &mlat, T0, T0), Pos::New);
+        assert_eq!(apply_external(&mut a, &jaero, T0 + 1000, T0 + 1000), Pos::None);
+        assert_eq!(crate::json::type_str(&a, T0 + 1000), "mlat");
+        // an aircraft with no place takes it, and MLAT takes over from it
+        let mut a = Aircraft::new(3, T0);
+        assert_eq!(apply_external(&mut a, &jaero, T0, T0), Pos::New);
+        assert_eq!(crate::json::type_str(&a, T0 + 1000), "adsc");
+        assert_eq!(apply_external(&mut a, &mlat, T0 + 16_000, T0 + 16_000), Pos::New);
+        assert_eq!(crate::json::type_str(&a, T0 + 16_000), "mlat");
+    }
+
+    #[test]
+    fn a_solved_aircraft_also_heard_directly_goes_back_to_mode_s() {
+        let mut a = Aircraft::new(1, T0);
+        let jaero = External { source: Source::Jaero, pos: Some((45.52, 9.25)), addr_type: Some(modes::AddrType::Jaero), ..Default::default() };
+        assert_eq!(apply_external(&mut a, &jaero, T0, T0), Pos::New);
+        // heard no other way: ADS-C for as long as the position stands
+        assert_eq!(crate::json::type_str(&a, T0 + 600_000), "adsc");
+        // heard directly: Mode S again a minute and a half on, the position kept
+        a.direct = T0 + 100_000;
+        assert_eq!(crate::json::type_str(&a, T0 + 80_000), "adsc");
+        assert_eq!(crate::json::type_str(&a, T0 + 100_000), "mode_s");
+        assert!(a.pos.valid(T0 + 100_000));
+    }
+
+    #[test]
+    fn an_aircraft_standing_still_keeps_a_fresh_position() {
+        let mut a = Aircraft::new(1, T0);
+        for i in 0..30u64 {
+            feed(&mut a, &enc::airborne_position(1, 45.5, 9.25, 35000, i % 2 == 1, 11), T0 + i * 1000);
+        }
+        assert_eq!(a.pos.src, Source::Adsb);
+        assert!(T0 + 29_000 - a.pos.t <= 1000, "position {} ms old", T0 + 29_000 - a.pos.t);
     }
 
     #[test]
