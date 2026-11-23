@@ -130,6 +130,10 @@ struct Cli {
     /// Also write the JSON files to this directory every interval
     #[arg(long)]
     write_json: Option<String>,
+    /// Also write what /metrics serves to this file every interval, for
+    /// a node exporter's textfile collector
+    #[arg(long)]
+    write_prom: Option<String>,
     /// Write per-day trace files here (tar1090's globe_history layout)
     #[arg(long)]
     write_globe_history: Option<String>,
@@ -223,6 +227,9 @@ struct Cli {
     tar1090_use_api: bool,
     #[arg(long, hide = true)]
     range_outline_hours: Option<f64>,
+    // readsb's debug output selection; aggd logs what it logs
+    #[arg(long, hide = true)]
+    debug: Option<String>,
 }
 
 pub struct Config {
@@ -661,6 +668,26 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             }
         }
     });
+
+    // the metrics as a file, as readsb's --write-prom writes them
+    if let Some(path) = cli.write_prom.clone() {
+        let c = ctx.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(c.cfg.json_every_ms));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut failing = false;
+            loop {
+                tick.tick().await;
+                let body = c.metrics(now_ms());
+                let (dir, name) = path.rsplit_once('/').unwrap_or((".", &path));
+                let ok = write_atomic(dir, name, &body).is_ok();
+                if ok == failing {
+                    failing = !ok;
+                    eprintln!("aggd: --write-prom {path}: {}", if ok { "writing again" } else { "cannot write" });
+                }
+            }
+        });
+    }
 
     // the JSON files on disk, for whatever reads them from there
     if let Some(dir) = cli.write_json.clone() {
