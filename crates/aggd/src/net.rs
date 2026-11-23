@@ -815,7 +815,8 @@ pub async fn sbs_ingest(ctx: Arc<Ctx>, s: TcpStream, proto: Proto, local: bool) 
             if track::apply_external(a, &e, now, wall) == Pos::New {
                 ctx.stats.positions.fetch_add(1, Ordering::Relaxed);
                 ctx.stats.pos_by_type[(a.addr_type as usize).min(13)].fetch_add(1, Ordering::Relaxed);
-                if proto == Proto::SbsInMlat && ctx.cfg.forward_mlat && (ctx.hub.full.receiver_count() > 0 || ctx.hub.reduced.receiver_count() > 0) {
+                let want_rp = ctx.hub.reduced_plus.receiver_count() > 0;
+                if proto == Proto::SbsInMlat && ctx.cfg.forward_mlat && (ctx.hub.full.receiver_count() > 0 || ctx.hub.reduced.receiver_count() > 0 || want_rp) {
                     // the result as extended squitters, stamped as MLAT
                     let frames = modes::encode::synthetic_position(addr & 0xFF_FFFF, a.pos.v.0, a.pos.v.1, e.alt_baro, e.gs.zip(e.track), e.baro_rate);
                     let mut bytes = Vec::with_capacity(72);
@@ -824,6 +825,14 @@ pub async fn sbs_ingest(ctx: Arc<Ctx>, s: TcpStream, proto: Proto, local: bool) 
                     }
                     out.full.extend_from_slice(&bytes);
                     out.reduced.extend_from_slice(&bytes);
+                    if want_rp {
+                        // from no receiver: the solver's, not the last one named
+                        for f in &frames {
+                            out.reduced_plus.extend_from_slice(&[0x1a, 0xE3]);
+                            push_escaped(&mut out.reduced_plus, &0u64.to_be_bytes());
+                            beast_encode(&mut out.reduced_plus, &Frame { kind: 0x33, ts: &MLAT_MAGIC, signal: 0, bytes: f });
+                        }
+                    }
                 }
                 let jaero = proto == Proto::SbsInJaero;
                 let to_main = ctx.hub.sbs.receiver_count() > 0 && (proto != Proto::SbsInMlat || ctx.cfg.forward_mlat_sbs) && !jaero;
@@ -842,24 +851,54 @@ pub async fn sbs_ingest(ctx: Arc<Ctx>, s: TcpStream, proto: Proto, local: bool) 
     }
 }
 
-/// Feed a subscriber from a stream until it closes or falls too far behind.
+/// Feed a subscriber from a stream until it closes.
+///
+/// The stream arrives as many small batches (one per read of each
+/// feeder's connection, thousands a second on a busy network). Written
+/// one by one, each its own packet, a consumer could not keep up with
+/// the full stream however fast its line, fell a whole backlog behind
+/// and was cut off again and again. So everything that is waiting goes
+/// out in one write. A consumer that is too slow all the same loses the
+/// oldest batches (whole frames, so the stream stays well-formed) and
+/// carries on from the oldest kept: it stays connected, a bounded time
+/// behind, and costs no memory of its own.
 async fn pump(ctx: Arc<Ctx>, mut s: TcpStream, mut rx: broadcast::Receiver<Chunk>, hello: Vec<u8>, heartbeat: &'static [u8]) {
+    use broadcast::error::{RecvError, TryRecvError};
+    const WRITE_MAX: usize = 256 * 1024;
     let _ = s.set_nodelay(true);
     if !hello.is_empty() && s.write_all(&hello).await.is_err() {
         return;
     }
+    let mut buf: Vec<u8> = Vec::with_capacity(16 * 1024);
     loop {
         match tokio::time::timeout(Duration::from_secs(30), rx.recv()).await {
             Ok(Ok(chunk)) => {
-                match tokio::time::timeout(Duration::from_secs(20), s.write_all(&chunk)).await {
+                buf.clear();
+                buf.extend_from_slice(&chunk);
+                while buf.len() < WRITE_MAX {
+                    match rx.try_recv() {
+                        Ok(c) => buf.extend_from_slice(&c),
+                        Err(TryRecvError::Lagged(n)) => {
+                            ctx.stats.out_skipped.fetch_add(n, Ordering::Relaxed);
+                        }
+                        Err(_) => break,
+                    }
+                }
+                // a consumer that takes nothing at all for this long is gone
+                match tokio::time::timeout(Duration::from_secs(20), s.write_all(&buf)).await {
                     Ok(Ok(())) => {
-                        ctx.stats.bytes_out.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                        ctx.stats.bytes_out.fetch_add(buf.len() as u64, Ordering::Relaxed);
                     }
                     _ => return,
                 }
+                if buf.capacity() > 2 * WRITE_MAX {
+                    buf = Vec::with_capacity(16 * 1024);
+                }
             }
-            // a consumer too slow to keep up is dropped, not waited for
-            Ok(Err(_)) => return,
+            Ok(Err(RecvError::Lagged(n))) => {
+                ctx.stats.out_skipped.fetch_add(n, Ordering::Relaxed);
+            }
+            Ok(Err(RecvError::Closed)) => return,
             Err(_) => {
                 if !heartbeat.is_empty() && s.write_all(heartbeat).await.is_err() {
                     return;
@@ -871,13 +910,14 @@ async fn pump(ctx: Arc<Ctx>, mut s: TcpStream, mut rx: broadcast::Receiver<Chunk
 
 const HEARTBEAT: &[u8] = &[0x1a, 0x31, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 
-fn subscribe(ctx: &Ctx, proto: Proto) -> (broadcast::Receiver<Chunk>, Vec<u8>, &'static [u8]) {
+/// `uuid`: the one given for this connection, over the general one.
+fn subscribe(ctx: &Ctx, proto: Proto, uuid: Option<&str>) -> (broadcast::Receiver<Chunk>, Vec<u8>, &'static [u8]) {
     match proto {
         Proto::BeastOut => (ctx.hub.full.subscribe(), Vec::new(), HEARTBEAT),
         Proto::BeastReduceOut => (ctx.hub.reduced.subscribe(), Vec::new(), HEARTBEAT),
         Proto::BeastReducePlusOut => {
             let mut hello = Vec::new();
-            if let Some(u) = &ctx.cfg.uuid {
+            if let Some(u) = uuid.or(ctx.cfg.uuid.as_deref()) {
                 let mut padded = [b'f'; 36];
                 for (o, b) in padded.iter_mut().zip(u.trim().bytes()) {
                     *o = b;
@@ -911,7 +951,7 @@ pub async fn listen(ctx: Arc<Ctx>, addr: String, proto: Proto) -> anyhow::Result
                     Proto::BeastIn => beast_ingest(ctx, s, peer, false).await,
                     p if p.is_input() => sbs_ingest(ctx, s, p, false).await,
                     p => {
-                        let (rx, hello, hb) = subscribe(&ctx, p);
+                        let (rx, hello, hb) = subscribe(&ctx, p, None);
                         pump(ctx.clone(), s, rx, hello, hb).await
                     }
                 }
@@ -922,7 +962,7 @@ pub async fn listen(ctx: Arc<Ctx>, addr: String, proto: Proto) -> anyhow::Result
 }
 
 /// Keep an outbound connection up, reconnecting with backoff.
-pub fn connect(ctx: Arc<Ctx>, host: String, port: u16, proto: Proto) {
+pub fn connect(ctx: Arc<Ctx>, host: String, port: u16, proto: Proto, uuid: Option<String>) {
     tokio::spawn(async move {
         let mut delay = 1u64;
         loop {
@@ -935,12 +975,17 @@ pub fn connect(ctx: Arc<Ctx>, host: String, port: u16, proto: Proto) {
                         Proto::BeastIn => beast_ingest(ctx.clone(), s, peer, true).await,
                         p if p.is_input() => sbs_ingest(ctx.clone(), s, p, true).await,
                         p => {
-                            let (rx, hello, hb) = subscribe(&ctx, p);
+                            let (rx, hello, hb) = subscribe(&ctx, p, uuid.as_deref());
                             pump(ctx.clone(), s, rx, hello, hb).await
                         }
                     }
                 }
-                Err(_) => delay = (delay * 2).min(30),
+                Err(e) => {
+                    if delay == 1 {
+                        eprintln!("aggd: cannot connect to {host}:{port} ({proto:?}): {e}; retrying");
+                    }
+                    delay = (delay * 2).min(30)
+                }
             }
             tokio::time::sleep(Duration::from_secs(delay)).await;
         }

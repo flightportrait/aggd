@@ -381,6 +381,12 @@ On the recorded traffic, in rough order of how often:
   (`tools/beast_out_probe.py`). readsb also sends an empty Mode A/C
   frame as a keep-alive every few seconds; aggd sends one only after
   30 s of silence.
+- A consumer too slow for an output stream stays connected and loses
+  the oldest of what it could not take, whole frames at a time
+  (`aggd_output_skipped_total` counts them); one that takes nothing for
+  20 s is dropped. Until 0.1.2 output went out a small batch per write,
+  and on a busy network a consumer of the full stream was cut off every
+  couple of seconds (600 feeders: 17 connections in 30 s; one since).
 - `stats.json` has every key readsb has, but the CPR and CPU breakdowns are
   zero or approximate.
 - Mode A/C: `--modeac` is accepted and, as with readsb on an aggregator,
@@ -412,6 +418,9 @@ coefficients in `wmm_data.rs` (NOAA, public domain).
 
 ## Tools
 
+- `tools/out_probe.py`: consumers on the Beast outputs of an aggregator
+  under load, one of them slow: connections each needed, frames, bytes
+  that were not a frame.
 - `tools/src_probe.py`: sixteen short histories of an aircraft heard
   directly, placed by MLAT and reported over ADS-C in turn, played to
   readsb and aggd, with when each changes what it shows.

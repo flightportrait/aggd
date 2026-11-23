@@ -99,7 +99,9 @@ struct Cli {
     http_port: Vec<u16>,
     /// host,port,protocol: an outbound connection. Protocols: beast_in,
     /// beast_out, beast_reduce_out, beast_reduce_plus_out, sbs_in,
-    /// sbs_in_mlat, sbs_in_jaero, sbs_in_prio, uat_in, sbs_out, json_out
+    /// sbs_in_mlat, sbs_in_jaero, sbs_in_prio, uat_in, sbs_out, json_out;
+    /// an optional fourth field uuid=UUID announces that id on this
+    /// beast_reduce_plus_out connection
     #[arg(long)]
     net_connector: Vec<String>,
     /// Forward each message's receiver id on beast_reduce_plus_out
@@ -270,6 +272,8 @@ pub struct Stats {
     pub bad: AtomicU64,
     pub bytes_in: AtomicU64,
     pub bytes_out: AtomicU64,
+    /// batches of output a consumer was too slow for and did not get
+    pub out_skipped: AtomicU64,
     pub sbs: AtomicU64,
     pub pos_by_type: [AtomicU64; 14],
     pub max_dist: AtomicU64,
@@ -381,6 +385,7 @@ impl Ctx {
         put("bad_frames_total", "counter", "Frames that did not decode", g(&self.stats.bad) as f64);
         put("bytes_in_total", "counter", "Bytes received from feeders", g(&self.stats.bytes_in) as f64);
         put("bytes_out_total", "counter", "Bytes sent on output streams", g(&self.stats.bytes_out) as f64);
+        put("output_skipped_total", "counter", "Batches of output that slow consumers did not get", g(&self.stats.out_skipped) as f64);
         put("aircraft_with_position", "gauge", "Aircraft listed with a current position", with as f64);
         put("aircraft_without_position", "gauge", "Aircraft listed without a current position", without as f64);
         put("aircraft_tracked", "gauge", "Aircraft in the table, including those kept for their trace", self.store.count.load(Ordering::Relaxed) as f64);
@@ -592,7 +597,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         anyhow::ensure!(parts.len() >= 3, "--net-connector wants host,port,protocol: {c}");
         let port: u16 = parts[1].parse().map_err(|_| anyhow::anyhow!("bad port in --net-connector {c}"))?;
         let proto = Proto::parse(parts[2]).ok_or_else(|| anyhow::anyhow!("unknown protocol {} in --net-connector {c}", parts[2]))?;
-        net::connect(ctx.clone(), parts[0].to_string(), port, proto);
+        // readsb's fourth field onward: uuid=... for this connection
+        let uuid = parts[3..].iter().find_map(|x| x.strip_prefix("uuid=")).map(str::to_string);
+        net::connect(ctx.clone(), parts[0].to_string(), port, proto, uuid);
     }
 
     // housekeeping, once a second

@@ -66,6 +66,7 @@ Leave it for a few days. Watch `/metrics` on aggd: memory
 | `--net-sbs-in-port`, `--net-sbs-jaero-in-port`, `--jaero-timeout` | the same |
 | `--net-connector=HOST,PORT,sbs_in_mlat` (results from mlatd / mlat-server) | the same |
 | `--net-bo-port`, `--net-beast-reduce-out-port`, `--net-beast-reduce-interval` | the same |
+| `--net-connector=HOST,PORT,beast_reduce_plus_out,uuid=UUID` | the same; MLAT results go out on the Beast outputs with `--forward-mlat`. Any number of consumers may connect to an output port; a readsb consuming one must not be in `--net-ingest` mode, which is for single receivers |
 | `--net-sbs-port`, `--net-sbs-reduce`, `--forward-mlat`, `--forward-mlat-sbs`, `--net-sbs-jaero-port` | the same |
 | `--net-json-port`, `--net-json-port-interval`, `--net-json-port-include-noposition` | the same |
 | `--net-api-port=PORT` | the same (or `--http-port`; one server answers both) |
