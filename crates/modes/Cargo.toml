@@ -1,0 +1,6 @@
+[package]
+name = "modes"
+description = "Mode S and ADS-B message decoding"
+version.workspace = true
+edition.workspace = true
+license.workspace = true

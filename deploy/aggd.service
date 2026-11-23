@@ -1,0 +1,27 @@
+# /etc/systemd/system/aggd.service
+[Unit]
+Description=aggd ADS-B aggregator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=aggd
+EnvironmentFile=-/etc/default/aggd
+# /etc/default/aggd sets AGGD_ARGS, for example:
+#   AGGD_ARGS="--net-bi-port 30004 --http-port 8080 --db-file /usr/local/share/tar1090/aircraft.csv.gz \
+#              --write-state /var/lib/aggd --write-globe-history /var/globe_history"
+ExecStart=/usr/local/bin/aggd $AGGD_ARGS
+Restart=always
+RestartSec=2
+# aggd saves its traces on SIGTERM; give it time on a large table
+TimeoutStopSec=60
+LimitNOFILE=65536
+StateDirectory=aggd
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/aggd /var/globe_history
+
+[Install]
+WantedBy=multi-user.target

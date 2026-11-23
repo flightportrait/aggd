@@ -1,0 +1,416 @@
+# aggd
+
+An ADS-B aggregator in Rust: receivers connect and send Beast, aggd keeps
+one table of aircraft and serves it in readsb's formats, so tar1090, API
+clients and downstream feeds work unchanged. It takes the place of readsb
+in its `--net-only` aggregator role. It is not a radio; on a receiver use
+[rx](https://github.com/flightportrait/rx).
+
+Status: experimental. It has been run beside readsb 3.16.21 on synthetic
+traffic, on recorded real traffic (25 minutes of one network's stream,
+about 700 aircraft, replayed to both), and live on that stream for eight
+hours at a time, and the two compared field by field; the numbers are
+below. **It has not yet carried a network in production**, nor run for
+days. The longest runs so far are two of 27 hours beside readsb: it
+stayed up and used 57 to 59 % of readsb's CPU time, but ended at 192 MB
+and 155 MB against readsb's 62 MB. Memory has since been reworked (see
+"Memory" below): with a day of history it holds about 82 MB, where a
+readsb keeping traces as well passed 100 MB within its first hour. The step before relying
+on it is a shadow run of days;
+[docs/MIGRATING.md](docs/MIGRATING.md) says how.
+
+## Run
+
+Option names follow readsb where the meaning is the same.
+
+```sh
+cargo build --release
+./target/release/aggd \
+    --net-bi-port 30004 \
+    --net-sbs-jaero-in-port 30009 \
+    --net-connector mlat-host,31003,sbs_in_mlat \
+    --net-bo-port 30005 --net-beast-reduce-out-port 30006 --net-sbs-port 30003 \
+    --http-port 8080 --web-root /usr/local/share/tar1090/html \
+    --db-file aircraft.csv.gz \
+    --write-globe-history /var/globe_history --write-state /var/lib/aggd
+```
+
+`aggd --help` lists everything. Flags readsb needs and aggd does not
+(`--net-only`, `--net-ingest`, `--write-json-globe-index`, …) are accepted
+and ignored. `Dockerfile` and `deploy/aggd.service` are there to start from.
+
+## What it does
+
+| | |
+|---|---|
+| In | Beast (receiver UUID; forwarded receiver ids from trusted links); BaseStation: plain, MLAT results, JAERO ADS-C, priority; UAT (dump978 raw lines) |
+| Out, streams | Beast full, Beast reduced, Beast reduced with receiver ids (MLAT results included with `--forward-mlat`), BaseStation (optionally rate-limited, optionally with MLAT), BaseStation JAERO only, JSON position lines; each as a listener or an outbound connector |
+| Out, HTTP | `aircraft.json`, `receiver.json`, `clients.json`, `receivers.json`, `stats.json`, `status.json`, `aircraft.binCraft[.zst]`, `globe_N.binCraft[.zst]`, `globeMil_N…`, `traces/xx/trace_{full,recent}_HEX.json`, `/globe_history/…`, `/metrics` (Prometheus), and the re-api queries: `all`, `circle`, `closest`, `box`, `find_hex`, `find_callsign`, `find_reg`, `find_type` (combinable, as tar1090 does), the `filter_*` set, `jv2`, `binCraft`, `zstd` |
+| Web | `--web-root DIR` serves a directory beside the data. With tar1090's html directory aggd is the whole map server: no nginx, nothing written to a tmpfs |
+| Kept | per-day trace files in tar1090's `globe_history` layout; traces across restarts; heat map files (`--heatmap N`) |
+| Decoded | DF0/4/5/11/16/17/18/20/21; ADS-B versions 0–2 (identification, surface and airborne position, velocity, emergency, ACAS advisories, target state, operational status), TIS-B and ADS-R; Comm-B registers 2,0 3,0 4,0 5,0 6,0 |
+| Derived | true heading from magnetic (WMM2025), wind, outside and total temperature, track from positions, airframe registration/type/flags from a tar1090-db file, military address blocks, round-trip time to each feeder |
+
+## Protection against bad feeders
+
+A network takes Beast from anyone. aggd assumes some of them are broken
+and a few are hostile:
+
+- **Connections**: a total limit, a limit per address, idle timeouts.
+- **Rate**: messages per second per link (`--max-receiver-rate`); the excess
+  is dropped, and a link far over for twenty seconds is refused for a
+  minute, doubling on each repeat up to an hour.
+- **Garbage**: a link sending mostly frames that fail a checksum the
+  receiver should have checked is refused for five minutes.
+- **Invented aircraft**: a link may introduce a thousand aircraft when it
+  connects and `--max-new-aircraft` a minute after; when a link is refused,
+  aircraft only it ever reported are forgotten. The table has a hard cap.
+- **False positions**: the same transmission heard by two receivers is
+  strong evidence; one receiver's word is not. A position that contradicts
+  a confirmed track is held back until a second receiver relays the same
+  message. If none does, the receiver is at fault; a receiver at fault on
+  five different aircraft in a minute has its positions ignored for ten.
+  If others do, the many are believed over the few: the track moves only
+  when more receivers relay the new position than half of those standing
+  behind the old one. That is how an aircraft whose GPS is interfered
+  with is followed (every receiver hears its jump), and how receivers
+  that lie identically lose to an honest majority, and are blamed. The
+  contradictions must also be a tenth or more of what the receiver sent
+  that minute, so a relay carrying half a network is not taken for a liar
+  on the strength of its volume.
+- **A lying majority**: counting heads fails when the liars outnumber
+  the honest. Against that, a position supplied or confirmed by a link
+  listed in `--net-trusted` holds its aircraft for half a minute: while
+  it does, no number of other receivers moves it, and those that try are
+  blamed. A trusted link's position replaces at once one that only
+  strangers gave, and a receiver heard over a trusted link is never
+  distrusted. Your own receivers are the one thing a group of strangers
+  cannot forge; with none of them hearing an aircraft, the majority is
+  still believed. In the test of this (25 liars, 10 honest), the 20 or so
+  aircraft only the liars could hear stay listed, by what they sent of
+  identity and altitude, without a position once the liars are
+  distrusted.
+- **Input**: BaseStation lines are length-limited and numbers must be
+  possible; HTTP paths cannot leave the directories they serve.
+- `--net-trusted` exempts your own nodes, and only they may forward
+  receiver ids. `status.json` and `/metrics` say what was refused and why.
+
+`tools/hostile.sh` runs two instances on the same traffic, one of them also
+fed by receivers that send garbage, lie about positions (each differently)
+and invent aircraft at 20,000 messages a second. It passes when the two
+outputs are the same and the receivers distrusted are exactly the ones
+that lied; it does, also with 800 ms of delay and 30 % loss on every
+link, and when the liars all tell the same lie (`--collude`). A fourth
+scenario puts 25 colluding liars against 10 honest receivers on trusted
+links: no aircraft moves and no honest receiver is distrusted (22 of the
+25 liars were). The same scenario without `--net-trusted` is the
+control: every aircraft is moved and all ten honest receivers are
+distrusted.
+`tools/fuzz.py` throws malformed input at every port.
+
+What this does not stop: liars that are the majority of the receivers
+hearing an aircraft that no trusted receiver hears (including a single
+liar that is the only one), and
+floods below the rate limits from many addresses.
+
+## Why it is lighter
+
+- Nothing is written to be served. readsb rewrites `aircraft.json`, every
+  globe tile and the traces to a tmpfs every second whether or not anyone
+  is looking. aggd renders a document when it is asked for and keeps it
+  for one refresh interval.
+- A transmission heard by fifteen receivers is decoded once. The other
+  fourteen copies match a short per-aircraft list of recent frames.
+- Memory follows the aircraft in the air, not the day's traffic. A day
+  of history is mostly aircraft that left hours ago: once silent, an
+  aircraft is reduced to its trace and last position, a tenth of a
+  tracking record, and is restored if it returns. Trace points are 24
+  bytes; an aircraft in flight keeps its newest few dozen open and packs
+  the rest away in chunks of about a hundred (differences between
+  successive points, by column, then zstd: about 13 bytes a point on
+  real traces). A chunk is written once and dropped whole when it ages
+  out, so the heap is not churned: recompressing a growing trace in
+  place left 14 MB of holes within an hour.
+- The airframe database (645,000 airframes, 34 MB of text) is held
+  compressed in 32 KB blocks, 20 MB less; a block is opened for the one
+  lookup each aircraft gets.
+
+## Measured
+
+`tools/bench.sh` feeds the same synthetic traffic to readsb (in Docker)
+and aggd, measures both, and compares their `aircraft.json` field by
+field. One machine (12 cores), 2026-11-16, 60 s windows, both with the
+airframe database loaded, aggd polled for `aircraft.json` once a second:
+
+| traffic | readsb | aggd |
+|---|---|---|
+| 235k msg/s, 3,800 aircraft, 300 receivers; readsb with globe index, binCraft, traces | 38 % of a core, 661 MB | 12 %, 73 MB |
+| the same; readsb writing `aircraft.json` only | 19 %, 76 MB | 13 %, 65 MB |
+| 1.06M msg/s, 8,600 aircraft, 600 receivers; readsb with globe index, binCraft, traces | 59 %, 882 MB | 26 %, 82 MB |
+
+Memory was read at the end of each run; neither process had reached a
+steady state for trace history by then. In the 235k runs
+the two listed the same aircraft and differed in about 10 of 11,412
+aircraft comparisons (signal-level averages, an aircraft caught mid-turn).
+In the 1.06M run readsb lacked 16 aircraft aggd had (some generator links
+to it had dropped) and 245 of 25,767 comparisons differed in signal level.
+
+What these numbers do not show: real traffic. The generator's messages are
+clean, every receiver hears a transmission in the same 100 ms (which
+flatters duplicate handling), readsb ran with `--net-ingest` off because
+its bad-receiver heuristic dropped the synthetic feeders, and aggd was not
+serving tiles to a map during the runs, where readsb wrote them all. For
+plain ingest the two are close: readsb is efficient C.
+
+## On real traffic
+
+`aggbench record` taped 25 minutes of a live network's Beast stream (an
+edge forwarding to a hub: rate-limited, with receiver ids, about 700
+aircraft worldwide, 1,800 messages a second). `tools/replay.sh` plays a
+tape to a fresh readsb and a fresh aggd at the speed it arrived and
+compares their `aircraft.json` as it plays.
+
+| | aircraft | fields compared | differing |
+|---|---|---|---|
+| 25-minute tape, at 5 min | 697 | 73,352 | 0.83 % |
+| at 10 min | 677 | 70,662 | 0.46 % |
+| at 15 min | 642 | 68,860 | 0.99 % |
+| at 20 min | 637 | 68,410 | 0.72 % |
+
+(Each row is three snapshots three seconds apart; the aircraft count is per
+snapshot. The first comparison of all, before any of the rules below,
+was 2.4 %.) Both list the same aircraft but for a handful at the edge of
+the 60-second listing window.
+
+Live on the same stream, both started together and compared every ten
+minutes (`tools/soak.sh run`): aggd stayed up for each of two eight-hour
+runs and a shorter one, on about four fifths of readsb's CPU time while
+also keeping a day of traces, which readsb was not asked to. The first
+run found two things no shorter test had: aircraft parked for more than
+ten minutes lost their position, and aircraft back after hours of
+silence were remembered when readsb had forgotten them. Both are fixed
+(see the rules below). The share of fields differing follows the time of
+day, with the traffic, rather than how long either has been up: a fresh
+start mid-day began where the previous run had ended.
+
+A fourth run found the worst fault so far, in the protection itself: two
+hours in, the link that relays half the network was taken for a lying
+receiver and its positions were ignored from then on, leaving about 700
+aircraft without a position for six hours. The penalty was meant to last
+ten minutes but the connections were never told it had ended, and it was
+triggered by a count of contradicted positions that a large relay reaches
+on honest traffic. Now the penalty ends, and a receiver is distrusted
+only when the contradictions are a tenth or more of what it sent. The
+run after that, eight hours overnight at about half the daytime traffic,
+stayed between 0.64 % and 0.78 % differing in every hour (worst single
+check 1.34 %), with nothing distrusted.
+
+The long runs also showed two costs that grew with uptime, neither
+visible in a one-minute benchmark. Memory rose in steps on the hour: the
+hourly state file was built whole in memory, and glibc kept the space;
+it is now streamed, the allocator is held to two heaps and free pages
+are handed back (`aggd_table_bytes` in the metrics says how much is
+real data). And CPU time crept up towards readsb's: every trace that had
+grown was rewritten to its day file each minute, which with eight hours
+of traces in memory was about half of all CPU time; the pass now takes
+ten minutes. A sixth run, eight daytime hours with the memory fixes,
+held 0.76 % to 1.03 % differing in every hour and grew smoothly instead
+of in steps; the history change was measured side by side on live
+traffic (1,410 against 2,658 CPU ticks in 40 minutes). A seventh run,
+eight hours from evening into night with everything above, used half of
+readsb's CPU time throughout (9,366 ticks against 18,234; the same
+share in the last hour as in the first), differed in 0.64 % to 0.89 % of
+fields in every hour, and ended at 97 MB. The same traces loaded into a
+fresh process take 89 MB, of which 43 MB is the table and its traces and
+the rest mostly the airframe database: what remains is data, and it is
+bounded by the hours of trace kept (`--trace-hours`, 24 by default).
+
+An eighth and a ninth run of 27 hours each (a full day and the start of
+the next, 680 to 2,250 aircraft) had aggd alive at each of their 162
+checks, differing from readsb in 0.88 % and 0.77 % of fields at the
+median (0.39 % to 1.37 %), on 59 % and 57 % of readsb's CPU time.
+
+### Memory
+
+Those two runs ended at 192 MB and 155 MB against readsb's 62 MB, and
+were still rising slowly after the day of history had filled. Nearly all
+of it was three things: a full 1.9 KB tracking record for each of the
+day's 15,000 aircraft, of which 2,000 are in the air at once; traces
+held uncompressed; and the airframe database as 34 MB of text. All three
+were changed (see "Why it is lighter"). The day of traces the ninth run
+ended with (15,260 aircraft, 2.8 million points), loaded into each
+build:
+
+| | eighth run's build | ninth run's | now |
+|---|---|---|---|
+| empty, database loaded | 42 MB | 42 MB | 20 MB |
+| with the day of traces | 160 MB | 166 MB | 55 MB |
+
+Traces fetched from the old and new builds are byte for byte the same.
+(The saved file leaves out the detail kept once a minute or so beside
+the points, so a day lived through is somewhat larger than a day
+loaded.) On the synthetic load the process went from 62 MB to 39 MB.
+
+Started beside readsb with that day of history already loaded, so in
+the state the earlier runs took 24 hours to reach, and at the afternoon
+peak of about 2,100 aircraft, aggd began at 67 MB against readsb's
+59 MB. Over the next five hours it rose to 82 MB and then stayed at 81
+to 82 MB for the following three and a half, while readsb settled at
+54 MB. Of aggd's 82 MB, 46 MB was the table and its traces (2.9 million
+points, 15,000 aircraft) and 14 MB was free space the allocator had not
+returned. `/metrics` gives the table's size (`aggd_table_bytes`) and the
+allocator's used and free bytes (`aggd_heap_used_bytes`,
+`aggd_heap_free_bytes`), which is how the growth was found to be holes
+and not data. That readsb was run bare, though: no globe index, no traces, no history
+files, while aggd always keeps a day of traces and writes the history.
+A second readsb started on the same stream with what a tar1090
+aggregator runs (`--write-json-globe-index --write-globe-history
+--heatmap 30`) held 82 MB a minute after starting, with no history yet,
+and 103 MB after 45 minutes, and used 36,600 CPU ticks an hour where
+aggd used 1,010 and the bare readsb 1,860. That is one night-time
+window of 45 minutes; a day of it has not been measured.
+
+Real traffic is where the rules that no standard states show up, and
+most of the work was finding them, one experiment at a time, with
+readsb as the reference (`tools/ttl.py`, `tools/wind_probe.py`,
+`tools/alt_probe.py`, `tools/probe.py`, and reading single aircraft out
+of the tape with `aggbench dump`):
+
+- how long each field is kept (60 s for most, three minutes for the
+  callsign) and when a lesser source may replace a better one (15 s);
+- an aircraft is an ADS-B one until a message comes a minute and a half
+  after its last own position; without a position its stated version
+  holds 45 s, stating it again renewing nothing; and nothing lapses
+  until a message arrives to find it old (`tools/version_probe.py`);
+- a surveillance or air-to-air reply's altitude is taken at once only
+  while a better one is fresh, otherwise when it agrees or is said twice;
+- one position message is placed relative to the last position up to ten
+  minutes old; even and odd messages pair up to 30 s apart when a ground speed was
+  heard in the last 20 s, less above 318 kt (about 2.65 NM of travel),
+  and 10 s when no recent speed is known (`tools/pair_probe.py`);
+- Comm-B registers 4,0 5,0 6,0 with fields marked absent; a reply that
+  reads as one register only is that register, and one that reads as two
+  is settled by whether Mach and airspeed agree at the altitude in the
+  reply itself, or dropped (`tools/bds50_probe.py`);
+- wind is derived when airspeed and heading arrive within a second and a
+  quarter of ground speed and track (shown at 1.2 s apart, not at 1.25),
+  with true airspeed up to two and a half seconds old and less than ten
+  degrees of roll, and lasts a minute or until the aircraft is 500 ft above or below
+  where it was taken; outside and total temperature when Mach and true
+  airspeed arrive within two and a half seconds of each other
+  (`tools/wind_probe2.py`); a squawk counts when heard twice;
+- a reply addressed by parity alone (altitude, identity, Comm-B) is
+  taken only within 15 s of a message that carries its own checksum
+  from the same aircraft (taken at 14 s, ignored at 15), and it is that
+  checked message, not the replies, that keeps the aircraft listed;
+- true heading follows from a magnetic one as that heading arrives, and
+  only while the position is under a minute old; a position that comes
+  afterwards does not bring it;
+- a geometric altitude follows from a barometric one and the difference
+  a velocity message carries, once per new altitude whichever kind of
+  message brought it, and lapses with the altitude
+  (`tools/geom_probe.py`);
+- on the ground, the heading field is the track unless the aircraft's
+  status message says otherwise; rebroadcast (ADS-R, TIS-B) versions are
+  kept apart from the aircraft's own;
+- (found only on an eight-hour live run) a message from the ground needs
+  a rough place to be read against, and the aircraft's own last position
+  serves however old it is; an aircraft silent for a quarter of an hour
+  (five minutes if it never had a position) starts afresh when it
+  returns, but its last position is still shown, up to an hour old.
+
+## Checked against
+
+- **readsb on real traffic**: above.
+- **readsb, in bulk, synthetic**: `tools/bench.sh` and `tools/compare.py`.
+- **readsb, message by message**: `tools/probe.py` sends one frame of each
+  kind to both and diffs JSON and BaseStation output after each.
+- **A real readsb as feeder**: it connects with `beast_reduce_plus_out`,
+  its UUID is taken, and the round trip is measured with its ping reply.
+- **tar1090**: the real page (3.14.1725) served by aggd draws the aircraft,
+  the table, and a selected aircraft's trace.
+- **A live network's public data** (ADSB Italia's `aircraft.json`, one
+  snapshot, 7,472 aircraft): wind and temperature formulas agree with the
+  reported values (median error 0.6 kt, 0.5°, 0.3 °C); magnetic declination
+  agrees on 2,524 aircraft (median 0.006°); the ACAS advisory in it decodes
+  to the same object, byte for byte.
+- **binCraft**: `tools/bincraft.py` decodes readsb's own file against
+  readsb's own JSON, then aggd's against aggd's.
+- **Deployment**: the Docker image builds and serves; the systemd unit
+  starts, and on stop writes its history and state.
+
+## Known differences from readsb
+
+Replaying 25 minutes of recorded traffic (2026-11-19, 41 paired
+snapshots, about 945,000 fields) four times as the rules for wind,
+temperature, true heading, unchecked replies and position pairing went
+in gave 0.63 %, 0.68 %, 0.64 % and 0.69 % of fields differing, against
+0.74 % to 0.76 % before them; the spread between runs of the same
+recording is about 0.05, so only the step from before to after is
+measured, not the order within.
+
+On the recorded traffic, in rough order of how often:
+
+- Wind appears for some aircraft in one and not the other (about 3 % of
+  aircraft with wind, after the pairing rules above were measured;
+  temperature under 1 %). readsb sometimes keeps a wind reading past a
+  minute or through a change of altitude, by a rule not yet found.
+- An aircraft that already has a place is only placed from two halves
+  heard by the same receiver, where readsb pairs any two; a first fix
+  pairs across receivers in both.
+- Signal level: readsb shows none (-49.5) for some aircraft aggd has a
+  level for.
+- Altitude, accuracy (NACp, SIL, Rc) and version differ for well under
+  a percent of aircraft at any moment. One case is not understood: an
+  aircraft whose version readsb set back to 0 as it was first placed.
+- `calc_track` and the DF18 non-transponder position noted in the probe.
+- BaseStation output carries each transmission once, not once per receiver
+  that heard it.
+- `stats.json` has every key readsb has, but the CPR and CPU breakdowns are
+  zero or approximate.
+- Mode A/C: `--modeac` is accepted and, as with readsb on an aggregator,
+  changes nothing shown: 180 Mode A/C messages sent to readsb with
+  `--modeac` produced no aircraft and no message count.
+- The heat map files decode with the same decoder as readsb's and tar1090
+  fetches and parses them; the dots themselves were not seen, the test
+  machine having no WebGL. readsb samples about a quarter of the aircraft
+  per interval where aggd writes all of them.
+- UAT input shows the exact position the message carries, where readsb
+  shows it re-quantised by a metre or two, and shows a position for
+  aircraft on the ground, which readsb does not. It was checked with
+  frames built from the standard's layout (`tools/uat_probe.py`), sent to
+  both; no recorded UAT traffic was available.
+- Not present: raw/ASTERIX/Kinetic/VRS formats, the range outline,
+  `globeRates.json`, tar1090's `chunks/` history (traces are used
+  instead), Comm-B registers beyond 2,0 3,0 4,0 5,0 6,0.
+
+## How it was written
+
+From the standards (Annex 10 vol. IV, DO-260B) for decoding, and from
+readsb's behaviour for everything else: the same input was fed to both and
+the outputs compared. readsb's source was not read. Three tables are data
+taken from outside: the large globe tiles in `tiles_data.rs` (readsb
+publishes them in `receiver.json`), the military address blocks in
+`mil_ranges.rs` (found by showing readsb one address in every sixteen and
+reading its flag back, `tools/milranges.py`), and the World Magnetic Model
+coefficients in `wmm_data.rs` (NOAA, public domain).
+
+## Tools
+
+- `tools/check.sh [quick]`: unit tests, malformed input, hostile
+  receivers, readsb side by side; start here.
+- `aggbench record SOURCE FILE`, `tools/replay.sh TAPE`, `aggbench dump
+  TAPE HEX`: tape a real Beast stream, replay it to readsb and aggd,
+  read one aircraft out of it. `tools/shadow.sh HOST PORT` does the same
+  live.
+- `tools/ttl.py`, `tools/wind_probe.py`, `tools/alt_probe.py`,
+  `tools/uat_probe.py`: experiments that measure a reference's rules.
+- `tools/soak.sh start HOST PORT DIR`: a shadow run that stays up, logging
+  the comparison and both processes' memory every ten minutes.
+- `aggbench sky HOST:PORT...`: a synthetic sky and receiver network,
+  optionally with `--garbage`, `--liars`, `--flood` receivers.
+- `tools/bench.sh PLANES RECEIVERS [full|bare] [SECONDS]`: beside readsb.
+- `tools/compare.py REF CANDIDATE`: field-by-field `aircraft.json` diff.
+- `tools/probe.py`, `tools/run-probe.sh HEX`: one message at a time.
+- `tools/hostile.sh`, `tools/fuzz.py`: misbehaving receivers, bad input.
+- `tools/bincraft.py FILE [aircraft.json]`: binCraft decoder and checker.
