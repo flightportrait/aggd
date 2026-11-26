@@ -722,6 +722,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                         eprintln!("aggd: --write-traces: writing again");
                     }
                     _ => {}
+                }
+            }
+        });
+    }
+
     // the metrics as a file, as readsb's --write-prom writes them
     if let Some(path) = cli.write_prom.clone() {
         let c = ctx.clone();
