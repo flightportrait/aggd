@@ -44,7 +44,7 @@ and ignored. `Dockerfile` and `deploy/aggd.service` are there to start from.
 | | |
 |---|---|
 | In | Beast (receiver UUID; forwarded receiver ids from trusted links); BaseStation: plain, MLAT results, JAERO ADS-C, priority; UAT (dump978 raw lines) |
-| Out, streams | Beast full, Beast reduced, Beast reduced with receiver ids (MLAT results included with `--forward-mlat`), BaseStation (optionally rate-limited, optionally with MLAT), BaseStation JAERO only, JSON position lines; each as a listener or an outbound connector |
+| Out, streams | Beast full, Beast reduced, either with receiver ids (`--net-receiver-id`; MLAT results included with `--forward-mlat`), BaseStation (optionally rate-limited, optionally with MLAT), BaseStation JAERO only, JSON position lines; each as a listener or an outbound connector |
 | Out, HTTP | `aircraft.json`, `receiver.json`, `clients.json`, `receivers.json`, `stats.json`, `status.json`, `aircraft.binCraft[.zst]`, `globe_N.binCraft[.zst]`, `globeMil_N…`, `traces/xx/trace_{full,recent}_HEX.json`, `/globe_history/…`, `/metrics` (Prometheus), and the re-api queries: `all`, `circle`, `closest`, `box`, `find_hex`, `find_callsign`, `find_reg`, `find_type` (combinable, as tar1090 does), the `filter_*` set, `jv2`, `binCraft`, `zstd` |
 | Web | `--web-root DIR` serves a directory beside the data. With tar1090's html directory aggd is the whole map server: no nginx, nothing written to a tmpfs |
 | Kept | per-day trace files in tar1090's `globe_history` layout; traces across restarts; heat map files (`--heatmap N`); with `--write-traces`, each aircraft's live trace files beside the `--write-json` files, as readsb keeps them |

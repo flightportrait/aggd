@@ -75,7 +75,7 @@ Leave it for a few days. Watch `/metrics` on aggd: memory
 | `--write-globe-history=DIR`, `--write-state=DIR` | the same. aggd's state file is its own format: it does not read readsb's, so traces start empty on the first run |
 | `--db-file`, `--db-file-lt` | the same |
 | `--json-trace-interval`, `--interactive-ttl` | the same |
-| `--net-receiver-id`, `--uuid`, outbound `beast_reduce_plus_out` to a hub | the same; the hub lists the edge under `--net-trusted` |
+| `--net-receiver-id`, `--uuid`, outbound `beast_reduce_plus_out` to a hub | the same; the hub lists the edge under `--net-trusted`. As with readsb, `--net-receiver-id` also names the receiver on the full and the reduced Beast outputs (`--net-bo-port`, `--net-beast-reduce-out-port`, `beast_out` and `beast_reduce_out` connectors): one marker, `0x1a 0xe3` and the eight-byte id, before each batch of frames from a receiver. A receiver that gave no UUID has an id aggd makes up for the connection (`ffff…`), where readsb derives one of its own; ids arriving on a link are passed on only from links under `--net-trusted` |
 | `--net-ingest` | accepted; aggd's own protections are always on (README) |
 | `--heatmap`, `--heatmap-dir` | the same |
 | `--modeac` | accepted; like readsb on an aggregator it shows nothing |
