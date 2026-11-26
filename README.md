@@ -71,8 +71,12 @@ and a few are hostile:
   message. If none does, the receiver is at fault; a receiver at fault on
   five different aircraft in a minute has its positions ignored for ten.
   If others do, the many are believed over the few: the track moves only
-  when more receivers relay the new position than half of those standing
-  behind the old one. That is how an aircraft whose GPS is interfered
+  when more receivers relay the new position than stand behind the old
+  one. Equal numbers are two aircraft under one address, or a recording
+  played back: the first is kept for as long as it goes on being heard,
+  as readsb keeps it, and the second is shown once the first has been
+  silent for seven seconds and seventeen of the second's messages have
+  come. That is how an aircraft whose GPS is interfered
   with is followed (every receiver hears its jump), and how receivers
   that lie identically lose to an honest majority, and are blamed. The
   contradictions must also be a tenth or more of what the receiver sent
@@ -366,7 +370,17 @@ On the recorded traffic, in rough order of how often:
 - Altitude, accuracy (NACp, SIL, Rc) and version differ for well under
   a percent of aircraft at any moment. One case is not understood: an
   aircraft whose version readsb set back to 0 as it was first placed.
-- `calc_track` and the DF18 non-transponder position noted in the probe.
+- The DF18 non-transponder position noted in the probe.
+- Two places under one address (`tools/jump_probe.py`, 40 short
+  histories through one receiver and through two): while the first
+  aircraft is heard neither moves to the second, through ten seconds of
+  the second alone. When the first stops, readsb shows the second 8 to
+  45 s later and aggd 10 to 26 s; at 60 km and at 9,000 km apart readsb
+  takes about 40 s whatever the message rate, by a rule not found.
+- An aircraft placed by a BaseStation feed and heard directly as well
+  (`tools/sbs_src_probe.py`): version, accuracy figures and kind change
+  at the same moments in both; a new aircraft is shown a second or two
+  sooner by aggd.
 - BaseStation output, plain and with `--net-sbs-reduce`, was compared
   with readsb's under load (1,400 aircraft, 40 receivers): the same
   lines by type to within 3 %. The reduced stream leaves out altitude
@@ -433,6 +447,11 @@ coefficients in `wmm_data.rs` (NOAA, public domain).
 
 ## Tools
 
+- `tools/jump_probe.py`, `tools/mlat_track_probe.py`,
+  `tools/sbs_src_probe.py`, `tools/rid_probe.py`: two aircraft under one
+  address; the direction shown for an aircraft only MLAT places; one a
+  BaseStation feed places that is heard directly too; receiver ids on
+  the Beast outputs. Each plays the same thing to readsb and aggd.
 - `tools/out_probe.py`: consumers on the Beast outputs of an aggregator
   under load, one of them slow: connections each needed, frames, bytes
   that were not a frame.
@@ -443,7 +462,9 @@ coefficients in `wmm_data.rs` (NOAA, public domain).
   outputs compared frame by frame.
 
 - `tools/check.sh [quick]`: unit tests, malformed input, hostile
-  receivers, readsb side by side; start here.
+  receivers, readsb side by side; start here. (These scripts stop the
+  aggd and aggbench they started and no other, so they can be run where
+  an aggregator is working; they do use ports 37004 to 39152.)
 - `aggbench record SOURCE FILE`, `tools/replay.sh TAPE`, `aggbench dump
   TAPE HEX`: tape a real Beast stream, replay it to readsb and aggd,
   read one aircraft out of it. `tools/shadow.sh HOST PORT` does the same
