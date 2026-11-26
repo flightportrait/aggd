@@ -96,6 +96,14 @@ enum Cmd {
         /// ground speed in the velocity message, knots
         #[arg(long, default_value_t = 440.0)]
         gs: f64,
+        /// where the position messages put the aircraft
+        #[arg(long, default_value_t = 45.5, allow_hyphen_values = true)]
+        lat: f64,
+        #[arg(long, default_value_t = 9.25, allow_hyphen_values = true)]
+        lon: f64,
+        /// altitude in the position messages, feet
+        #[arg(long, default_value_t = 36000)]
+        alt: i32,
     },
 }
 
@@ -110,17 +118,16 @@ fn main() -> anyhow::Result<()> {
             };
             tape::replay(&file, &targets, speed, only)
         }
-        Cmd::Frames { hex, df4_alt, roll, track_rate, gs } => {
+        Cmd::Frames { hex, df4_alt, roll, track_rate, gs, lat, lon, alt: pos_alt } => {
             use modes::{alt, encode as e};
             let a = u32::from_str_radix(&hex, 16)?;
             let h = |f: &[u8]| f.iter().map(|b| format!("{b:02X}")).collect::<String>();
-            let (lat, lon) = (45.5, 9.25);
             let ac = alt::ac13_encode(36000);
             let out: Vec<(&str, Vec<u8>)> = vec![
                 ("df11", e::df11(a, false).to_vec()),
                 ("ident", e::ident(a, b"PROBE1  ", 0xA3).to_vec()),
-                ("pos_even", e::airborne_position(a, lat, lon, 36000, false, 11).to_vec()),
-                ("pos_odd", e::airborne_position(a, lat, lon, 36000, true, 11).to_vec()),
+                ("pos_even", e::airborne_position(a, lat, lon, pos_alt, false, 11).to_vec()),
+                ("pos_odd", e::airborne_position(a, lat, lon, pos_alt, true, 11).to_vec()),
                 ("velocity", e::velocity(a, gs as _, 250.0, -640, Some(225)).to_vec()),
                 ("velocity_air", e::velocity_airspeed(a, 252.0, 450, true, -640).to_vec()),
                 ("emergency", e::emergency(a, 1, 0x7700).to_vec()),
