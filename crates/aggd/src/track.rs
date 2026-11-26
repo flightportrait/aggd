@@ -249,6 +249,9 @@ pub struct Aircraft {
     /// the message in hand came over a link the operator trusts
     /// (`--net-trusted`); set by the caller before each message
     pub by_trusted: bool,
+    /// the receiver location given with the message in hand is the
+    /// aggregator's own, not the receiver's; set by the caller
+    pub ref_is_site: bool,
     /// when a trusted link last supplied or confirmed the track's
     /// position (0: never)
     anchor: u32,
@@ -393,6 +396,7 @@ impl Aircraft {
             blame_due: ([0; 4], 0),
             far: None,
             by_trusted: false,
+            ref_is_site: false,
             anchor: 0,
             pos_trusted: false,
             pos_wit: [(0, 0); 6],
@@ -1157,6 +1161,9 @@ fn reach_m(a: &Aircraft, surface: bool, now: Ms, dt: f64) -> f64 {
 const SOLVED_SLACK_M: f64 = 20_000.0;
 /// How long a far decode waits for another to agree with it.
 const FAR_HOLD: Ms = 10_000;
+/// How far from the aggregator's own location a surface position read
+/// against it is believed: what one receiver there could hear.
+const SITE_REACH_M: f64 = 500_000.0;
 /// Fixes that fitted before a track holds against messages from elsewhere.
 const ESTABLISHED: u8 = 3;
 /// How long a track must have had no message of its own before
@@ -1237,7 +1244,8 @@ fn position(a: &mut Aircraft, c: &Cpr, src: Source, now: Ms, rx: u64, rx_ref: Op
                 // has no location of its own.
                 let known = if a.pos.src != Source::Invalid { Some(a.pos.v) } else { a.last_place };
                 let r = if have_pos { Some(a.pos.v) } else { rx_ref.or(known) };
-                r.and_then(|(rl, ro)| cpr::global_surface(e.lat, e.lon, d.lat, d.lon, c.odd, rl, ro))
+                let by_site = a.ref_is_site && !have_pos && known.is_none() && rx_ref.is_some();
+                r.and_then(|(rl, ro)| cpr::global_surface(e.lat, e.lon, d.lat, d.lon, c.odd, rl, ro).filter(|&(l, o)| !by_site || dist_m(rl, ro, l, o) <= SITE_REACH_M))
             } else {
                 global = true;
                 cpr::global_airborne(e.lat, e.lon, d.lat, d.lon, c.odd)
@@ -2139,6 +2147,27 @@ mod tests {
         // a track the solver gives is shown instead
         apply_external(&mut a, &External { track: Some(123.0), gs: Some(400.0), ..at((45.006, 9.00294)) }, T0 + 4000, T0 + 4000);
         assert_eq!(shown(&a, T0 + 4000), None);
+    }
+
+    #[test]
+    fn an_aircraft_first_heard_on_the_ground_is_placed_by_the_site() {
+        // no receiver location, no history: the aggregator's own place
+        // serves, for an airport a receiver there could hear
+        let say = |a: &mut Aircraft, p: (f64, f64), site: (f64, f64)| {
+            for i in 0..2u64 {
+                let m = modes::decode(&enc::surface_position(a.addr, p.0, p.1, 10.0, 90.0, i == 1), |_| true).unwrap();
+                a.ref_is_site = true;
+                apply(a, &m, 100, T0 + 500 * i, 1, Some(site), i);
+            }
+        };
+        let mut a = Aircraft::new(1, T0);
+        say(&mut a, (45.63, 8.72), (45.5, 9.2));
+        assert!(a.pos_valid(T0 + 500) && (a.pos.v.0 - 45.63).abs() < 1e-3 && (a.pos.v.1 - 8.72).abs() < 1e-3);
+        // one a quarter of the globe from the site decodes to somewhere
+        // near it, and is not believed
+        let mut b = Aircraft::new(2, T0);
+        say(&mut b, (40.64, -73.78), (45.5, 9.2));
+        assert!(!b.pos_valid(T0 + 500), "placed at {:?}", b.pos.v);
     }
 
     #[test]

@@ -525,6 +525,15 @@ fn handle_frame(ctx: &Ctx, link: &mut Link<'_>, rid: u64, f: &Frame<'_>, now: Ms
         Some(c) if c.surface && !a.pos_valid(now) => ctx.reg.reference(rid),
         _ => None,
     };
+    // A receiver with no place of its own (a link that names none, one
+    // newly connected): the aggregator's --lat/--lon, as readsb reads a
+    // surface position against its own, but only for a place a receiver
+    // near there could hear.
+    a.ref_is_site = rx_ref.is_none();
+    let rx_ref = rx_ref.or(match m.cpr {
+        Some(c) if c.surface && !a.pos_valid(now) => ctx.cfg.site,
+        _ => None,
+    });
     if !a.db_checked {
         a.db_checked = true;
         a.db = ctx.db.as_ref().and_then(|d| d.describe(m.addr));
