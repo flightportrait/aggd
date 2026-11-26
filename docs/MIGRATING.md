@@ -74,7 +74,7 @@ Leave it for a few days. Watch `/metrics` on aggd: memory
 | `--write-json-globe-index`, binCraft, zstd | always on, rendered on request |
 | `--write-globe-history=DIR`, `--write-state=DIR` | the same. aggd's state files are its own format: it does not read readsb's, so traces start empty on the first run. Stopping and starting: step 6 |
 | `--db-file`, `--db-file-lt` | the same |
-| `--json-trace-interval`, `--interactive-ttl` | the same |
+| `--json-trace-interval`, `--interactive-ttl` | the same; the interval is 30 s when not given, as readsb's is (it was 20 s at first), and the points kept between intervals follow readsb's rule (README, "Known differences") |
 | `--net-receiver-id`, `--uuid`, outbound `beast_reduce_plus_out` to a hub | the same; the hub lists the edge under `--net-trusted`. As with readsb, `--net-receiver-id` also names the receiver on the full and the reduced Beast outputs (`--net-bo-port`, `--net-beast-reduce-out-port`, `beast_out` and `beast_reduce_out` connectors): one marker, `0x1a 0xe3` and the eight-byte id, before each batch of frames from a receiver. A receiver that gave no UUID has an id aggd makes up for the connection (`ffff…`), where readsb derives one of its own; ids arriving on a link are passed on only from links under `--net-trusted` |
 | `--net-ingest` | accepted; aggd's own protections are always on (README) |
 | `--heatmap`, `--heatmap-dir` | the same |

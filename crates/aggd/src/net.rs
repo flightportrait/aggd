@@ -557,6 +557,7 @@ fn handle_frame(ctx: &Ctx, link: &mut Link<'_>, rid: u64, f: &Frame<'_>, now: Ms
             if m.source == Source::Adsb && !a.pos_surface {
                 note_position(ext, rid, r.lat, r.lon, trusted);
             }
+            crate::trace::again(a, now, ctx.cfg.trace_interval_ms);
         }
         Pos::None => {
             if ctx.cfg.json_port_noposition && ctx.hub.json.receiver_count() > 0 && !a.pos_valid(now) {

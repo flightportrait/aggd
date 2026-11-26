@@ -1,3 +1,4 @@
+mod flight;
 mod sky;
 mod tape;
 
@@ -73,6 +74,17 @@ enum Cmd {
         #[arg(long)]
         only: Option<String>,
     },
+    /// Play scripted flights (one --plane each) to Beast inputs: see
+    /// flight.rs for the keys. Used to measure a trace's rules.
+    Flight {
+        #[arg(required = true)]
+        targets: Vec<String>,
+        /// key=value,... (alt, gs, track, vrate, turn, accel, from, to, ground, flip, start, gap=A-B, pos, novel, hex, lat, lon)
+        #[arg(long = "plane", required = true)]
+        planes: Vec<String>,
+        #[arg(long, default_value_t = 600)]
+        seconds: u64,
+    },
     /// Print one aircraft's frames from a recording, decoded.
     Dump {
         file: String,
@@ -109,6 +121,7 @@ enum Cmd {
 
 fn main() -> anyhow::Result<()> {
     match Cli::parse().cmd {
+        Cmd::Flight { targets, planes, seconds } => flight::run(&targets, &planes, seconds),
         Cmd::Dump { file, hex } => tape::dump(&file, u32::from_str_radix(&hex, 16)?),
         Cmd::Record { source, file, seconds } => tape::record(&source, &file, seconds),
         Cmd::Replay { file, targets, speed, only } => {
