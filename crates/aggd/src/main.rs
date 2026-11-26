@@ -216,6 +216,8 @@ struct Cli {
     #[arg(long, hide = true)]
     net_connector_delay: Option<f64>,
     #[arg(long, hide = true)]
+    net_ro_interval_beast_reduce: Option<f64>,
+    #[arg(long, hide = true)]
     stats_every: Option<u32>,
     #[arg(long, hide = true)]
     decode_threads: Option<u32>,

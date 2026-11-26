@@ -266,10 +266,10 @@ files, while aggd always keeps a day of traces and writes the history.
 A second readsb started on the same stream with what a tar1090
 aggregator runs (`--write-json-globe-index --write-globe-history
 --heatmap 30`) held 82 MB a minute after starting, with no history yet,
-and 124 MB after three hours, still rising by about 10 MB an hour, and
-used 37,800 CPU ticks an hour (a tenth of a core) where aggd used 1,040
-and the bare readsb 1,900. Those are three night-time hours with about
-300 aircraft in the air; a day of it has not been measured.
+124 MB after three hours, 256 MB after fifteen and 347 MB after 38,
+when it was stopped, and used 42,500 CPU ticks an hour (an eighth of a
+core). Over the 48 hours of the same run aggd stayed at 91 to 92 MB and
+used 1,620 ticks an hour, and the bare readsb 57 MB and 2,720.
 
 Real traffic is where the rules that no standard states show up, and
 most of the work was finding them, one experiment at a time, with
@@ -365,8 +365,11 @@ On the recorded traffic, in rough order of how often:
   a percent of aircraft at any moment. One case is not understood: an
   aircraft whose version readsb set back to 0 as it was first placed.
 - `calc_track` and the DF18 non-transponder position noted in the probe.
-- BaseStation output carries each transmission once, not once per receiver
-  that heard it.
+- BaseStation output, plain and with `--net-sbs-reduce`, was compared
+  with readsb's under load (1,400 aircraft, 40 receivers): the same
+  lines by type to within 3 %. The reduced stream leaves out altitude
+  replies of aircraft with a current ADS-B altitude, as readsb's did;
+  whether readsb does so for every aircraft was not measured.
 - MLAT and ADS-C beside direct reception (`tools/src_probe.py`): an
   aircraft's own position always wins, MLAT replaces it after 15 s of
   silence, and an ADS-C report places only an aircraft that has had no

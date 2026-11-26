@@ -251,13 +251,9 @@ fn sbs_line(out: &mut Vec<u8>, a: &mut Aircraft, m: &Msg, pos: Pos, now: Ms) {
         11 => 8,
         _ => return,
     };
-    if ty == 1 {
-        // identification repeats every few seconds; say it when it changes
-        match m.callsign {
-            Some(c) if c != a.sbs_callsign => a.sbs_callsign = c,
-            _ => return,
-        }
-    }
+    // (Identification goes out each time it is heard, as readsb sends it:
+    // said only when it changed, a consumer that connected after an
+    // aircraft's first never learned its callsign.)
     let t = sbs_time(now);
     let tilde = if a.addr & modes::NON_ICAO != 0 { "~" } else { "" };
     let _ = write!(out, "MSG,{},1,1,{}{:06X},1,{},{},", ty, tilde, a.addr & 0xFF_FFFF, t, t);
@@ -452,6 +448,16 @@ fn handle_frame(ctx: &Ctx, link: &mut Link<'_>, rid: u64, f: &Frame<'_>, now: Ms
             if ctx.hub.full.receiver_count() > 0 {
                 beast_encode(&mut out.full, f);
             }
+            // The plain BaseStation stream has a line for every copy
+            // heard, as readsb's has (31,500 lines a second where the
+            // reduced stream had 4,600, forty receivers on 1,400
+            // aircraft); the reduced one says each thing once. Only a
+            // consumer of the plain stream costs the decoding.
+            if !ctx.cfg.sbs_reduce && ctx.hub.sbs.receiver_count() > 0 {
+                if let Some(m) = modes::decode_with(frame, |x| x == addr, &hints) {
+                    sbs_line(&mut out.sbs, a, &m, if position { Pos::Duplicate } else { Pos::None }, now);
+                }
+            }
             return;
         }
     }
@@ -556,7 +562,10 @@ fn handle_frame(ctx: &Ctx, link: &mut Link<'_>, rid: u64, f: &Frame<'_>, now: Ms
         }
     }
     if ctx.hub.sbs.receiver_count() > 0 {
-        let pass = !ctx.cfg.sbs_reduce || {
+        // (an altitude reply from an aircraft whose own ADS-B altitude is
+        // current says nothing new: readsb's reduced stream had none)
+        let redundant = matches!(m.df, 4 | 20) && a.adsb_pos != 0 && now.saturating_sub(a.adsb_pos) < track::STALE;
+        let pass = !ctx.cfg.sbs_reduce || !redundant && {
             let (kind, mult) = reduce_kind(&m);
             let due = now.saturating_sub(a.sbs_last[kind]) >= ctx.cfg.reduce_interval_ms * mult;
             if due {
