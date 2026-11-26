@@ -130,6 +130,11 @@ struct Cli {
     /// Also write the JSON files to this directory every interval
     #[arg(long)]
     write_json: Option<String>,
+    /// With --write-json, also keep each aircraft's trace there as readsb
+    /// does: traces/<last two hex digits>/trace_recent_<hex>.json and
+    /// trace_full_<hex>.json, gzipped, rewritten as the trace grows
+    #[arg(long)]
+    write_traces: bool,
     /// Write per-day trace files here (tar1090's globe_history layout)
     #[arg(long)]
     write_globe_history: Option<String>,
@@ -495,6 +500,7 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn run(cli: Cli) -> anyhow::Result<()> {
+    anyhow::ensure!(!cli.write_traces || cli.write_json.is_some(), "--write-traces writes beside --write-json, which is not set");
     let uuid = match (&cli.uuid, &cli.uuid_file) {
         (Some(u), _) => Some(u.clone()),
         (None, Some(f)) => std::fs::read_to_string(f).ok().map(|s| s.trim().to_string()),
@@ -663,6 +669,48 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             }
         }
     });
+
+    // the trace files on disk: a quarter of the table each second, so an
+    // aircraft adding points has its trace_recent rewritten every few
+    // seconds; first, files no aircraft kept answers for are removed, and
+    // again every ten minutes as traces age out
+    if let (true, Some(dir)) = (cli.write_traces, cli.write_json.clone()) {
+        let c = ctx.clone();
+        tokio::spawn(async move {
+            if (0..256).any(|i| std::fs::create_dir_all(format!("{dir}/traces/{i:02x}")).is_err()) {
+                eprintln!("aggd: --write-traces: cannot create {dir}/traces");
+            }
+            let mut tick = tokio::time::interval(Duration::from_secs(1));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let step = track::SHARDS / persist::TRACE_PASS_S as usize;
+            let (mut n, mut failing) = (0u64, false);
+            loop {
+                tick.tick().await;
+                let (c, dir2, sweep) = (c.clone(), dir.clone(), n % 600 == 0);
+                let from = (n % persist::TRACE_PASS_S) as usize * step;
+                n += 1;
+                let res = tokio::task::spawn_blocking(move || {
+                    if sweep {
+                        persist::sweep_traces(&c, &dir2);
+                    }
+                    persist::write_traces(&c, &dir2, from, from + step)
+                })
+                .await;
+                // say so once when it stops working, and once when it works again
+                match res {
+                    Ok((_, failed)) if failed > 0 && !failing => {
+                        failing = true;
+                        eprintln!("aggd: --write-traces: cannot write to {dir}/traces");
+                    }
+                    Ok((written, 0)) if written > 0 && failing => {
+                        failing = false;
+                        eprintln!("aggd: --write-traces: writing again");
+                    }
+                    _ => {}
+                }
+            }
+        });
+    }
 
     // the JSON files on disk, for whatever reads them from there
     if let Some(dir) = cli.write_json.clone() {

@@ -70,7 +70,7 @@ Leave it for a few days. Watch `/metrics` on aggd: memory
 | `--net-sbs-port`, `--net-sbs-reduce`, `--forward-mlat`, `--forward-mlat-sbs`, `--net-sbs-jaero-port` | the same |
 | `--net-json-port`, `--net-json-port-interval`, `--net-json-port-include-noposition` | the same |
 | `--net-api-port=PORT` | the same (or `--http-port`; one server answers both) |
-| `--write-json=DIR` + nginx serving `/data/` | `--http-port PORT` serves them from memory. `--write-json DIR` also writes `aircraft.json`, `receiver.json`, `stats.json`, `status.json`, `clients.json` and `receivers.json` to DIR every `--write-json-every` seconds (the directory is created; a failure to write is logged once), for bots and scripts that read from disk |
+| `--write-json=DIR` + nginx serving `/data/` | `--http-port PORT` serves them from memory. `--write-json DIR` also writes `aircraft.json`, `receiver.json`, `stats.json`, `status.json`, `clients.json` and `receivers.json` to DIR every `--write-json-every` seconds (the directory is created; a failure to write is logged once), for bots and scripts that read from disk. readsb also keeps each aircraft's trace there when it keeps traces; with `--write-traces` aggd does too (`traces/xx/trace_recent_HEX.json` and `trace_full_HEX.json`, gzipped, rewritten as the trace grows) |
 | `--write-json-globe-index`, binCraft, zstd | always on, rendered on request |
 | `--write-globe-history=DIR`, `--write-state=DIR` | the same. aggd's state file is its own format: it does not read readsb's, so traces start empty on the first run |
 | `--db-file`, `--db-file-lt` | the same |
