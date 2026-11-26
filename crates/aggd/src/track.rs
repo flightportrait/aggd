@@ -1099,6 +1099,15 @@ fn adopt(a: &mut Aircraft, lat: f64, lon: f64, c: &Cpr, src: Source, now: Ms, rx
     a.pos.t = now;
     a.pos.src = src;
     track_from(a, before, lat, lon, src, now);
+    if before.is_none() {
+        // readsb's direction for a first position of the aircraft's own
+        // is the one from 0 N 0 E (9 for an aircraft over Milan with no
+        // place before, on the one-message probe), and for one placed
+        // from elsewhere 0
+        a.calc_track.v = bearing(0.0, 0.0, lat, lon) as f32;
+        a.calc_track.t = now;
+        a.calc_track.src = src;
+    }
     let (nic, rc) = modes::nic_rc(c, a.version.max(0) as u8, a.nic_a, a.nic_c);
     a.nic = nic;
     a.rc = rc;
