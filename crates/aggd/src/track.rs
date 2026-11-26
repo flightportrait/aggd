@@ -2104,6 +2104,30 @@ mod tests {
     }
 
     #[test]
+    fn an_aircraft_only_mlat_places_has_a_direction() {
+        // tools/mlat_track_probe.py beside readsb: north at first, then
+        // the direction of each step of 100 m or more, and of no smaller
+        let at = |p: (f64, f64)| External { source: Source::Mlat, pos: Some(p), addr_type: Some(modes::AddrType::Mlat), ..Default::default() };
+        // as the JSON has it: none beside a reported track
+        let shown = |a: &Aircraft, t: Ms| a.track.get(t).is_none().then(|| if a.calc_track.t != 0 { a.calc_track.v.round() } else { 0.0 });
+        let mut a = Aircraft::new(1, T0);
+        apply_external(&mut a, &at((45.0, 9.0)), T0, T0);
+        assert_eq!(shown(&a, T0), Some(0.0));
+        // 231 m east in a second: 450 kt
+        apply_external(&mut a, &at((45.0, 9.00294)), T0 + 1000, T0 + 1000);
+        assert_eq!(shown(&a, T0 + 1000), Some(90.0));
+        // 31 m north, a helicopter at 60 kt: no word on direction
+        apply_external(&mut a, &at((45.00028, 9.00294)), T0 + 2000, T0 + 2000);
+        assert_eq!(shown(&a, T0 + 2000), Some(90.0));
+        // due north is 360, 0 being an aircraft that has none yet
+        apply_external(&mut a, &at((45.003, 9.00294)), T0 + 3000, T0 + 3000);
+        assert_eq!(shown(&a, T0 + 3000), Some(360.0));
+        // a track the solver gives is shown instead
+        apply_external(&mut a, &External { track: Some(123.0), gs: Some(400.0), ..at((45.006, 9.00294)) }, T0 + 4000, T0 + 4000);
+        assert_eq!(shown(&a, T0 + 4000), None);
+    }
+
+    #[test]
     fn two_aircraft_under_one_address() {
         // Rome and Texas, each sending twice a second, through one
         // receiver that hears both and through two receivers each.
