@@ -482,6 +482,53 @@ On the recorded traffic, in rough order of how often:
   aircraft on the ground, which readsb does not. It was checked with
   frames built from the standard's layout (`tools/uat_probe.py`), sent to
   both; no recorded UAT traffic was available.
+- Traces: which positions become points is readsb's rule as far as it
+  could be measured (the list is at `trace::due`), and on scripted
+  flights the two keep the same points at the same moments
+  (`tools/trace_probe.sh`). At first aggd kept a point every interval
+  and at 2 degrees or 200 ft of change, and an operator's shadow run
+  found its day files with a median 66 % of readsb's points: readsb
+  keeps far more of a climb or descent low down (every 75 ft below
+  7,000 ft), of the ground, of an aircraft's first minute and of the
+  minute after take-off and landing, and a point for every change of
+  vertical rate over 200 ft/min. Beside readsb on the same live traffic
+  for 35 minutes (840 aircraft, interval 30 s), counting what each
+  holds for good: 96.8 % of readsb's points (per aircraft a median of
+  96 %, 88 % at the tenth percentile, 110 % at the ninetieth), 314
+  points an aircraft-hour to its 322; the old rule had 75.0 % (75 %,
+  43 %, 102 %) and 246. `trace_recent` the same: 96.9 % against 78.0 %.
+  It costs what the points cost: with the same traffic from the same
+  start, after half an hour, 61,384 points to the old rule's 41,238,
+  4.5 MB of table to 3.4 MB, 12.0 MB resident to 10.3 MB, and a tenth
+  more processor time (0.34 % of a core to 0.31 %).
+  What is left: readsb's `trace_full` of an aircraft it has stopped
+  hearing, written some ten to sixteen minutes later, ends with every
+  position of its last 47 s (about 95 points), which are gone from the
+  file again if the aircraft returns; aggd keeps the last position
+  heard and no more (keeping them would take 2.3 KB for every aircraft
+  in the air and a kilobyte of trace for every time one is lost).
+  Counting those files too, aggd has 81.8 % of all the points readsb
+  published in the 35 minutes (median 94 %, tenth percentile 30 %: the
+  aircraft heard briefly), the old rule 63.4 % (68 %, 19 %). readsb keeps a point 350 ft from the last above
+  12,000 ft about one time in four, where aggd waits for 375; an
+  aircraft that sends no track gets points from the track readsb works
+  out of its positions. `trace_recent` holds 92 points in readsb and
+  142 here. readsb wrote no day file in two and a half hours of running
+  nor when stopped, so its day files were not compared: what is
+  compared is what it publishes in `trace_recent` and `trace_full`.
+  One point in four carries what else was known of the aircraft
+  (callsign, squawk, selected altitude and the rest), as in readsb's
+  files; they were kept once a minute at first, and stamped so that
+  hardly any was ever shown.
+- Day files (`--write-globe-history`) keep what is in them. A day file
+  is written from the table, and at first was simply replaced: after
+  a start without `--write-state` the day's earlier points were lost
+  from the file of every aircraft heard again (346 of 420 files in a
+  five-minute trial), after a crash those since the hourly state file
+  (214 of 493), and with `--trace-hours` under 24 whatever had aged
+  out. Now the file is read first in those cases and its points stay
+  (0 files lost points in the same trials). A day begun by readsb in a
+  shared directory is carried on the same way.
 - Trace files on disk (`--write-traces`): readsb's `trace_recent` is
   rewritten about every 4 s while the aircraft adds points, as aggd's
   is; it holds 92 points where aggd's holds the 142 the HTTP server
@@ -508,6 +555,15 @@ reading its flag back, `tools/milranges.py`), and the World Magnetic Model
 coefficients in `wmm_data.rs` (NOAA, public domain).
 
 ## Tools
+
+- `tools/trace_probe.sh`: scripted flights (`aggbench flight`: a climb,
+  a turn, a silence, a landing, each at one steady rate) played to
+  readsb and aggd, and the trace points each kept, flight by flight.
+  `tools/trace_watch.py` collects the points readsb publishes as it
+  goes (it rewrites `trace_full` rarely and not when stopped);
+  `tools/trace_compare.py` compares two aggregators' traces of live
+  traffic: points per aircraft, per aircraft-hour, and what the points
+  only one of them has were doing.
 
 - `tools/jump_probe.py`, `tools/mlat_track_probe.py`,
   `tools/sbs_src_probe.py`, `tools/rid_probe.py`: two aircraft under one

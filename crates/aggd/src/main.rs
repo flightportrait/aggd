@@ -122,7 +122,7 @@ struct Cli {
     #[arg(long, default_value_t = 33.0)]
     jaero_timeout: f64,
     /// Seconds between trace points in steady flight
-    #[arg(long, default_value_t = 20.0)]
+    #[arg(long, default_value_t = 30.0)]
     json_trace_interval: f64,
     /// Seconds between refreshes of aircraft.json
     #[arg(long, default_value_t = 1.0)]

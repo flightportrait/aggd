@@ -294,6 +294,14 @@ pub struct Aircraft {
     pub db: Option<std::sync::Arc<crate::db::Entry>>,
     pub db_checked: bool,
     pub trace: crate::trace::Trace,
+    /// the position heard last, whether or not the trace kept it
+    pub trace_prev: Option<crate::trace::Packed>,
+    /// until when the trace keeps a point every second
+    pub trace_dense_until: Ms,
+    /// trace points since the last that said what else was known
+    pub trace_plain: u8,
+    /// its newest positions, while it is low enough to be landing
+    pub trace_ring: Option<Box<crate::trace::Ring>>,
     /// Where the aircraft was before it was forgotten: nothing shown,
     /// only a rough place for surface messages to be read against.
     pub last_place: Option<(f64, f64)>,
@@ -411,6 +419,10 @@ impl Aircraft {
             db: None,
             db_checked: false,
             trace: crate::trace::Trace::default(),
+            trace_prev: None,
+            trace_dense_until: now + crate::trace::DENSE_MS,
+            trace_plain: 0,
+            trace_ring: None,
             last_place: None,
         }
     }
@@ -1792,6 +1804,7 @@ impl Store {
                 if a.trace.is_empty() {
                     continue;
                 }
+                crate::trace::settle(&mut a, now);
                 a.trace.compact(0);
                 s.gone.insert(addr, Gone { seen: a.seen, pos: a.pos, nic: a.nic, rc: a.rc, last_place: a.last_place, heat_tag: a.heat_tag, trace: std::mem::take(&mut a.trace) });
             }
@@ -1800,6 +1813,7 @@ impl Store {
             let cut = now.saturating_sub(keep_trace);
             for a in s.map.values_mut() {
                 a.fade_position(now);
+                crate::trace::settle(a, now);
                 a.trace.trim_before(cut);
             }
             for g in s.gone.values_mut() {

@@ -21,13 +21,119 @@ pub fn civil(ms: Ms) -> (i64, i64, i64) {
 
 const DAY: Ms = 86_400_000;
 
+/// One day's trace document as text: for each point its time, in tenths
+/// of a second since the epoch, and its row after the time. aggd's own
+/// files and readsb's both read this way.
+fn day_rows(doc: &str) -> Option<Vec<(u64, &str)>> {
+    let at = doc.find("\"timestamp\":")? + 12;
+    let ts: f64 = doc[at..at + doc[at..].find(|c| c == ',' || c == '}')?].trim().parse().ok()?;
+    let trace = doc.find("\"trace\":")?;
+    let open = trace + doc[trace..].find('[')? + 1;
+    let (mut depth, mut quoted, mut escaped, mut start) = (0usize, false, false, 0usize);
+    let mut rows = Vec::new();
+    for (i, c) in doc.bytes().enumerate().skip(open) {
+        if quoted {
+            match c {
+                _ if escaped => escaped = false,
+                b'\\' => escaped = true,
+                b'"' => quoted = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            b'"' => quoted = true,
+            b'[' | b'{' => {
+                if depth == 0 {
+                    start = i + 1;
+                }
+                depth += 1;
+            }
+            // the end of the trace itself
+            b']' | b'}' if depth == 0 => break,
+            b']' | b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    let (t, rest) = doc[start..i].split_once(',')?;
+                    rows.push((((ts + t.trim().parse::<f64>().ok()?) * 10.0).round() as u64, rest));
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(rows)
+}
+
+/// `fresh`, a day's trace as the table has it, with the points that
+/// only `old`, the file already on disk, has, each put back at its
+/// time. None when the file has nothing the table lacks (or cannot be
+/// read: then it is replaced, as before).
+fn with_rows_of(old: &str, fresh: &str) -> Option<String> {
+    use std::fmt::Write;
+    let mut rows = day_rows(fresh)?;
+    let ours = rows.len();
+    let old = day_rows(old)?;
+    let only: Vec<(u64, &str)> = old.iter().filter(|r| rows.binary_search_by_key(&r.0, |x| x.0).is_err()).copied().collect();
+    rows.extend(only);
+    if rows.len() == ours {
+        return None;
+    }
+    rows.sort_by_key(|r| r.0);
+    let base = rows[0].0;
+    let at = fresh.find("\"timestamp\":")? + 12;
+    let comma = at + fresh[at..].find(',')?;
+    let trace = fresh.find("\"trace\":")?;
+    let open = trace + fresh[trace..].find('[')? + 1;
+    let mut out = String::with_capacity(fresh.len() + old.len() * 80);
+    out.push_str(&fresh[..at]);
+    let _ = write!(out, " {:.3}", base as f64 / 10.0);
+    out.push_str(&fresh[comma..open]);
+    out.push_str(" \n");
+    for (i, (t, rest)) in rows.iter().enumerate() {
+        let _ = write!(out, "[{:.2},{rest}]{}\n", (t - base) as f64 / 10.0, if i + 1 < rows.len() { "," } else { "" });
+    }
+    out.push_str("]}\n");
+    Some(out)
+}
+
+fn gunzip(path: &str) -> Option<String> {
+    let mut text = String::new();
+    flate2::read::GzDecoder::new(std::fs::File::open(path).ok()?).read_to_string(&mut text).ok()?;
+    Some(text)
+}
+
+/// A day file to write: where, what the table has for that day, and
+/// whether the file already there may hold more than that.
+struct DayFile {
+    addr: u32,
+    day: u32,
+    path: String,
+    name: String,
+    body: String,
+    look: bool,
+}
+
 /// Write the day files of every aircraft in shards `from..to` whose
 /// trace has grown since its last write. Rendering happens under the
 /// shard lock, compression and file I/O after it is released.
+///
+/// A day file is the day as the table has it, and the table does not
+/// always have the whole day: after a start without a state file it has
+/// nothing from before; after a crash, nothing since the hourly state
+/// file; with `--trace-hours` under 24, or an aircraft heard for more
+/// than a day, the beginning has aged out. Writing the table's day over
+/// the file then lost what only the file had (side by side on live
+/// traffic, 150 s, a restart, 120 s more: 346 of 420 files began later
+/// than before, with no state file; with `--trace-hours` cut to match,
+/// 120 of 418). So the file is read first whenever this process has not
+/// yet written it from this trace, or found more in it than the trace
+/// had, or the trace's day now begins later than it did; what only the
+/// file has stays. In the ordinary case, a trace that has had its whole
+/// day in the table since this process first wrote it, nothing is read.
 pub fn write_history(ctx: &Ctx, dir: &str, from: usize, to: usize) -> usize {
     let mut files = 0;
     for s in &ctx.store.shards()[from..to] {
-        let mut jobs: Vec<(String, String, String)> = Vec::new();
+        let mut jobs: Vec<DayFile> = Vec::new();
         {
             let mut s = s.lock();
             let s = &mut *s;
@@ -43,6 +149,7 @@ pub fn write_history(ctx: &Ctx, dir: &str, from: usize, to: usize) -> usize {
                 // every day that has an unwritten point gets its file rewritten
                 let first_day = points[trace.written].t() / DAY;
                 let last_day = points[n - 1].t() / DAY;
+                let mut noted = (trace.file_day, trace.file_more, trace.file_first);
                 for day in first_day..=last_day {
                     let lo = points.partition_point(|p| p.t() / DAY < day);
                     let hi = points.partition_point(|p| p.t() / DAY <= day);
@@ -53,19 +160,34 @@ pub fn write_history(ctx: &Ctx, dir: &str, from: usize, to: usize) -> usize {
                     let hex = crate::json::hex(addr);
                     let mut body = String::with_capacity((hi - lo) * 70 + 256);
                     trace::render(addr, db.as_deref(), &points[lo..hi], &details, &mut body);
-                    jobs.push((
-                        format!("{dir}/{y:04}/{m:02}/{d:02}/traces/{}", &hex[hex.len() - 2..]),
-                        format!("trace_full_{hex}.json"),
+                    let first = points[lo].t();
+                    let look = trace.file_day != day as u32 || trace.file_more || first > trace.file_first;
+                    noted = (day as u32, false, if trace.file_day == day as u32 { first.min(trace.file_first) } else { first });
+                    jobs.push(DayFile {
+                        addr,
+                        day: day as u32,
+                        path: format!("{dir}/{y:04}/{m:02}/{d:02}/traces/{}", &hex[hex.len() - 2..]),
+                        name: format!("trace_full_{hex}.json"),
                         body,
-                    ));
+                        look,
+                    });
                 }
                 drop((points, details));
                 trace.written = n;
+                (trace.file_day, trace.file_more, trace.file_first) = noted;
             }
         }
-        for (path, name, body) in jobs {
+        // traces whose file held more than they did: looked at again next time
+        let mut more: Vec<(u32, u32)> = Vec::new();
+        for DayFile { addr, day, path, name, mut body, look } in jobs {
             if std::fs::create_dir_all(&path).is_err() {
                 continue;
+            }
+            if look {
+                if let Some(whole) = gunzip(&format!("{path}/{name}")).and_then(|old| with_rows_of(&old, &body)) {
+                    body = whole;
+                    more.push((addr, day));
+                }
             }
             let mut e = flate2::write::GzEncoder::new(Vec::with_capacity(body.len() / 5), flate2::Compression::new(4));
             let _ = e.write_all(body.as_bytes());
@@ -73,6 +195,19 @@ pub fn write_history(ctx: &Ctx, dir: &str, from: usize, to: usize) -> usize {
             let tmp = format!("{path}/.{name}.tmp");
             if std::fs::write(&tmp, gz).is_ok() && std::fs::rename(&tmp, format!("{path}/{name}")).is_ok() {
                 files += 1;
+            }
+        }
+        if !more.is_empty() {
+            let mut s = s.lock();
+            let s = &mut *s;
+            for (addr, day) in more {
+                let trace = match s.map.get_mut(&addr) {
+                    Some(a) => Some(&mut a.trace),
+                    None => s.gone.get_mut(&addr).map(|g| &mut g.trace),
+                };
+                if let Some(t) = trace.filter(|t| t.file_day == day) {
+                    t.file_more = true;
+                }
             }
         }
     }
@@ -1546,5 +1681,66 @@ mod scale {
             println!("day files, {n} threads: {:6.2} s  {files} files", t.elapsed().as_secs_f64());
             let _ = std::fs::remove_dir_all(&hist);
         }
+    }
+}
+
+#[cfg(test)]
+mod day_tests {
+    use super::*;
+
+    fn point(t: Ms, lat: i32, lon: i32) -> Point {
+        Point { t, lat, lon, alt: trace::GROUND, alt_geom: trace::NONE, gs: 0, track: 0, rate: 0, geom_rate: 0, ias: 0, flags: 0, addr_type: 0 }
+    }
+
+    fn doc(points: &[Point]) -> String {
+        let packed: Vec<Packed> = points.iter().map(Packed::pack).collect();
+        let mut out = String::new();
+        trace::render(0x4ca123, None, &packed, &[], &mut out);
+        out
+    }
+
+    fn times(doc: &str) -> Vec<u64> {
+        day_rows(doc).unwrap().iter().map(|r| r.0 * 100).collect()
+    }
+
+    /// The table after a restart without a state file, or after a crash,
+    /// or with its first hours aged out, has less of the day than the
+    /// file written before: the file keeps what it had.
+    #[test]
+    fn a_day_file_keeps_the_points_the_table_no_longer_has() {
+        let t0 = 1_795_680_000_000;
+        let p = |s: u64| point(t0 + s * 1000, 45_000_000 + s as i32, 9_000_000);
+        let before = doc(&[p(0), p(30), p(60), p(90)]);
+        // a restart: the table begins again later
+        let after = doc(&[p(200), p(230)]);
+        let whole = with_rows_of(&before, &after).unwrap();
+        assert_eq!(times(&whole), [0, 30, 60, 90, 200, 230].map(|s| t0 + s * 1000));
+        assert!(whole.starts_with(&after[..after.find("\"timestamp\"").unwrap()]) && whole.contains(&format!("\"timestamp\": {:.3},", t0 as f64 / 1000.0)));
+        assert!(whole.contains("[0.00,45.000000,9.000000,") && whole.contains("[230.00,45.000230,9.000000,") && whole.ends_with("null]\n]}\n"));
+        // a crash: the state file had the trace to 30 s, the day file to 90 s
+        let whole = with_rows_of(&before, &doc(&[p(0), p(30), p(200)])).unwrap();
+        assert_eq!(times(&whole), [0, 30, 60, 90, 200].map(|s| t0 + s * 1000));
+        // written again from that: nothing more to add, and so on for good
+        assert!(with_rows_of(&whole, &whole).is_none());
+        // the ordinary case: the table has all the file has, and more
+        assert!(with_rows_of(&before, &doc(&[p(0), p(30), p(60), p(90), p(120)])).is_none());
+        // a file that cannot be read is replaced
+        assert!(with_rows_of("{\"icao\":", &after).is_none());
+    }
+
+    /// A day begun by readsb and carried on by aggd, in the directory
+    /// they share: readsb's rows stay, as it wrote them.
+    #[test]
+    fn a_day_file_written_by_readsb_is_carried_on() {
+        let t0 = 1_795_680_000_000u64;
+        let readsb = format!(
+            "{{\"icao\":\"4ca123\",\"version\":\"readsb 3.16\",\"timestamp\": {:.3},\"trace\":[[0.0,45.1,9.1,36000,440.5,90.2,1,0,{{\"type\":\"adsb_icao\",\"flight\":\"A]B,[C \"}},\"adsb_icao\",36400,0,250,0.2],[30.02,45.2,9.2,36000,440.5,90.2,0,0,null,\"adsb_icao\",36400,0,250,0.2]]}}",
+            t0 as f64 / 1000.0
+        );
+        let ours = doc(&[point(t0 + 30_000, 45_200_000, 9_200_000), point(t0 + 60_000, 45_300_000, 9_300_000)]);
+        let whole = with_rows_of(&readsb, &ours).unwrap();
+        // (the point both have, a hundredth apart, is the table's)
+        assert_eq!(times(&whole), [0, 30, 60].map(|s| t0 + s * 1000));
+        assert!(whole.contains("[0.00,45.1,9.1,36000,440.5,90.2,1,0,{\"type\":\"adsb_icao\",\"flight\":\"A]B,[C \"},\"adsb_icao\",36400,0,250,0.2],\n"));
     }
 }
