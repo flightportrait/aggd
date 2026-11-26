@@ -133,10 +133,13 @@ floods below the rate limits from many addresses.
   tracking record, and is restored if it returns. Trace points are 24
   bytes; an aircraft in flight keeps its newest few dozen open and packs
   the rest away in chunks of about a hundred (differences between
-  successive points, by column, then zstd: about 13 bytes a point on
+  successive points, by column, then zstd: about 12 bytes a point on
   real traces). A chunk is written once and dropped whole when it ages
   out, so the heap is not churned: recompressing a growing trace in
-  place left 14 MB of holes within an hour.
+  place left 14 MB of holes within an hour. The same chunks, as they
+  are, make up the state file: saving copies them and restoring reads
+  them, and since none is ever rewritten, stopping only has to save the
+  ones added since the hourly save.
 - The airframe database (645,000 airframes, 34 MB of text) is held
   compressed in 32 KB blocks, 20 MB less; a block is opened for the one
   lookup each aircraft gets.
@@ -253,9 +256,9 @@ build:
 | with the day of traces | 160 MB | 166 MB | 55 MB |
 
 Traces fetched from the old and new builds are byte for byte the same.
-(The saved file leaves out the detail kept once a minute or so beside
-the points, so a day lived through is somewhat larger than a day
-loaded.) On the synthetic load the process went from 62 MB to 39 MB.
+(The saved file of that time left out the detail kept once a minute or
+so beside the points, so a day lived through was somewhat larger than a
+day loaded; it is saved too now.) On the synthetic load the process went from 62 MB to 39 MB.
 
 Started beside readsb with that day of history already loaded, so in
 the state the earlier runs took 24 hours to reach, and at the afternoon
@@ -276,6 +279,60 @@ aggregator runs (`--write-json-globe-index --write-globe-history
 when it was stopped, and used 42,500 CPU ticks an hour (an eighth of a
 core). Over the 48 hours of the same run aggd stayed at 91 to 92 MB and
 used 1,620 ticks an hour, and the bare readsb 57 MB and 2,720.
+
+#### A large network
+
+An operator with 740 receivers (50,000 messages a second, 12,000 to
+17,400 aircraft at once, 75,561 with a trace over the day) saw memory
+grow by about 50 MB an hour, to 1,416 MB at the evening peak, of which
+the table was 1,000 to 1,020 MB. That is the day filling, at his 76
+million or so points a day, and it stops there: a trace is cut at
+`--trace-hours` (whole chunks, so a trace may run up to one chunk, 127
+points at most, past it), and an aircraft not heard for that long is
+dropped. What the table holds in the steady state:
+
+    11.5 MB for each million points of the last 24 hours
+     + 4 KB for each aircraft in the air (2 KB of tracking record, and
+            its newest points, up to 127, at 24 bytes)
+     + 0.3 KB for each aircraft kept for its trace
+     + 36 bytes for each detail (what else the aircraft said of itself,
+            kept beside a point when it changed, and every ten minutes)
+
+which for him is 875 + 70 + 23 MB and the details, or 13 MB for every
+thousand aircraft of the day at his thousand points each. (Details came
+to one for every ten points in 25 minutes of real traffic, which would be
+a fifth more; his table says less than a tenth over a day.) (The 11.5 is 10.7 bytes a point
+packed, and the rest what each chunk and each buffer costs besides; it
+was 12.0 before chunks were compressed harder, zstd level 13 for 3: a
+table of 76 million points went from 916 to 877 MB, read back the same.
+What else was tried on a day of real traces: chunks four times the size,
+7 % less but a trace then outlives its hours by as much; a trained
+dictionary, 6 %; level 19, 1 % more than 13 for five times the time.)
+`aggd_trace_points` and `aggd_table_bytes` in `/metrics` are the two
+sides of it.
+
+That it is flat after the first day is tested three ways. A week of
+steady traffic in simulated time (a test, `a_week_of_steady_traffic_
+holds_one_day_of_it`): the points, bytes and aircraft held on days three
+to seven are within 2 % of the second day's (5 % for the aircraft). A
+25-minute tape of real traffic (900 aircraft at once) played three times
+over with `--trace-hours 0.1`, so that the six minutes kept pass twelve
+times: from the first quarter hour to the last the table held 14,000 to
+14,700 points in 2.7 to 2.9 MB (4.0 for the minutes when the end of the
+tape and its beginning overlap), and the process 10.0 to 10.5 MB from
+the 25th minute on. And the same with 18 minutes kept, so that aircraft
+are forgotten and return, for 75 minutes: 43,500 to 45,900 points in 4.6
+to 5.3 MB from the 25th minute on, the process 12.1 to 12.8 MB.
+
+The memory of the process beyond the table (his 400 MB) is not accounted
+for here: `aggd_heap_used_bytes` less `aggd_table_bytes` is what else is
+in use (the rendered documents, the connections' buffers, the airframe
+database), `aggd_heap_free_bytes` what the allocator holds and has not
+given back.
+
+Stopping and starting at that size are in `docs/MIGRATING.md`, step 6;
+`at_scale` in `persist.rs` builds such a table from any real state file
+and times them.
 
 Real traffic is where the rules that no standard states show up, and
 most of the work was finding them, one experiment at a time, with
