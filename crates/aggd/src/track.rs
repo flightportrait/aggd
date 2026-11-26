@@ -692,7 +692,7 @@ impl Aircraft {
             return None;
         }
         // a device that is not a transponder is shown its version while its squitters last
-        let own = matches!(self.addr_type, AddrType::AdsbIcao | AddrType::ModeS) || self.addr_type_t == 0;
+        let own = matches!(self.addr_type, AddrType::AdsbIcao | AddrType::ModeS | AddrType::Other) || self.addr_type_t == 0;
         (own || now.saturating_sub(self.es_seen) <= ES_TTL).then_some(self.version)
     }
 
@@ -794,7 +794,11 @@ pub fn apply(a: &mut Aircraft, m: &Msg, signal: u8, now: Ms, rx: u64, rx_ref: Op
             } else if m.df == 17 && ran_out {
                 a.ver_t = now;
             }
-        } else if a.version >= 0 && ran_out {
+        } else if a.version >= 0 && ran_out && a.addr_type != AddrType::Other {
+            // (not one a BaseStation feed places: beside readsb its
+            // version was still shown 130 s after its last squitter,
+            // and never blinked while they went on;
+            // tools/sbs_src_probe.py)
             a.version = -1;
         }
     }
@@ -1535,6 +1539,17 @@ pub fn apply_external(a: &mut Aircraft, e: &External, now: Ms, wall: Ms) -> Pos 
         return Pos::None;
     }
     track_from(a, before, lat, lon, src, now);
+    if src == Source::Sbs {
+        // A place from a BaseStation feed says nothing of how good the
+        // aircraft's own fix is, and readsb drops what the aircraft said
+        // of it with each one: an aircraft heard directly as well shows
+        // nac_p, nac_v, sil, gva and sda only from each status message
+        // to the next feed position (tools/sbs_src_probe.py).
+        for f in [&mut a.nac_p, &mut a.nac_v, &mut a.sil, &mut a.gva, &mut a.sda] {
+            f.src = Source::Invalid;
+        }
+        a.sil_type = 3;
+    }
     a.nic = 0;
     a.rc = 0;
     a.pos_rx = 0;
