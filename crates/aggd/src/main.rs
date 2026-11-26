@@ -149,7 +149,8 @@ struct Cli {
     /// Directory for heat map files (default: the globe history directory)
     #[arg(long)]
     heatmap_dir: Option<String>,
-    /// Save traces here on exit and hourly, and restore them at start
+    /// Save traces here (all of them hourly, what they gained since on
+    /// exit) and restore them at start
     #[arg(long)]
     write_state: Option<String>,
     /// Serve this directory over HTTP beside the data: tar1090's html
@@ -311,6 +312,7 @@ pub struct Ctx {
     pub cache: http::Cache,
     pub guard: guard::Guard,
     pub heat: heatmap::Heatmap,
+    pub state: persist::StateFiles,
     pub started: Ms,
 }
 
@@ -510,7 +512,11 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let threads = cli.threads.unwrap_or(2).max(1);
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(threads).max_blocking_threads(8).enable_all().build()?;
-    rt.block_on(run(cli))
+    rt.block_on(run(cli))?;
+    // Everything that had to reach the disk has. Leaving through the
+    // runtime's own shutdown would wait for whatever housekeeping is in
+    // flight and then free the table a buffer at a time.
+    std::process::exit(0)
 }
 
 async fn run(cli: Cli) -> anyhow::Result<()> {
@@ -578,6 +584,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         cache: http::Cache::default(),
         guard: guard::Guard::new(limits),
         heat: heatmap::Heatmap::default(),
+        state: persist::StateFiles::default(),
         started: now_ms(),
     });
 
@@ -670,16 +677,22 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                     let _ = tokio::task::spawn_blocking(move || c.heat.sample(&c, &dir, now, every * 1000)).await;
                 }
             }
-            if n % 3600 == 0 {
+            // The state, whole: a minute after starting, then every hour.
+            // Stopping then only has to write what was gained since (the
+            // first of them soon, so that this holds from the start, also
+            // when what was restored came from an earlier version's file).
+            if n % 3600 == 60 {
                 if let Some(dir) = &state_dir {
                     let (c, dir) = (hk.clone(), dir.clone());
-                    let _ = tokio::task::spawn_blocking(move || {
-                        if let Err(e) = persist::save_state(&c, &dir) {
-                            eprintln!("aggd: state not saved: {e}");
+                    // (not awaited: on a slow disk a gigabyte takes a
+                    // while, and housekeeping goes on meanwhile)
+                    tokio::task::spawn_blocking(move || {
+                        match persist::save_state(&c, &dir, false) {
+                            Err(e) if e.kind() != std::io::ErrorKind::Interrupted => eprintln!("aggd: state not saved: {e}"),
+                            _ => {}
                         }
                         release_memory();
-                    })
-                    .await;
+                    });
                 }
             }
         }
@@ -793,15 +806,23 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         _ = term.recv() => {}
     }
     eprintln!("aggd: stopping");
-    if let Some(dir) = &cli.write_globe_history {
-        let files = persist::write_history(&ctx, dir, 0, track::SHARDS);
-        eprintln!("aggd: wrote {files} trace files to {dir}");
-    }
+    // The state first: it is a second or two (what the traces gained
+    // since the last hourly save) and with it nothing is lost, the points
+    // no day file has yet included neither. Should the time allowed for
+    // stopping run out during the day files, the next start writes them.
+    ctx.state.stopping.store(true, Ordering::Relaxed);
     if let Some(dir) = &cli.write_state {
-        match persist::save_state(&ctx, dir) {
-            Ok(n) => eprintln!("aggd: saved the traces of {n} aircraft to {dir}"),
+        let t = std::time::Instant::now();
+        match persist::save_state(&ctx, dir, true) {
+            Ok(n) => eprintln!("aggd: saved the traces of {n} aircraft to {dir} in {:.1} s", t.elapsed().as_secs_f64()),
             Err(e) => eprintln!("aggd: state not saved to {dir}: {e}"),
         }
+    }
+    if let Some(dir) = &cli.write_globe_history {
+        let t = std::time::Instant::now();
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let files = persist::write_history_all(&ctx, dir, threads);
+        eprintln!("aggd: wrote {files} trace files to {dir} in {:.1} s", t.elapsed().as_secs_f64());
     }
     Ok(())
 }

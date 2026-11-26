@@ -225,14 +225,24 @@ struct Cold {
     last: Ms,
 }
 
-const PACKED: usize = std::mem::size_of::<Packed>();
-const DETAIL: usize = std::mem::size_of::<Detail>();
+pub const PACKED: usize = std::mem::size_of::<Packed>();
+pub const DETAIL: usize = std::mem::size_of::<Detail>();
 // neither struct may have hidden padding: their bytes are read as they are
 const _: () = assert!(PACKED == 24 && DETAIL == 72 && std::mem::align_of::<Detail>() == 8);
 
 /// Open points at which the older ones are packed away, and how many stay.
 const OPEN_MAX: usize = 128;
 const OPEN_KEEP: usize = 32;
+
+/// How hard zstd works on a chunk. A chunk is packed once and held for a
+/// day, so the time is well spent: on a day of real traces (2.5 million
+/// points in chunks of 96 at most) level 3 took 13 µs a chunk for 11.21
+/// bytes a point, 7: 28 µs for 10.94, 13: 88 µs for 10.68, 19: 460 µs for
+/// 10.59. At a thousand points a second that is a thousandth of a core.
+const LEVEL: i32 = 13;
+/// Where many chunks are packed at once and time counts: saving the open
+/// points when stopping, reading the state file of an earlier version.
+const LEVEL_FAST: i32 = 3;
 
 /// The bytes of `v`. Sound for `Packed` and `Detail` only: plain numbers,
 /// `repr(C)`, no padding.
@@ -320,12 +330,12 @@ fn rows(cols: &[u8], stride: usize, diff: bool) -> Vec<u8> {
 }
 
 impl Cold {
-    fn pack(points: &[Packed], details: &[Detail]) -> Option<Cold> {
+    fn pack(points: &[Packed], details: &[Detail], level: i32) -> Option<Cold> {
         let last = points.last()?.t();
         let mut raw = Vec::with_capacity(points.len() * PACKED + details.len() * DETAIL);
         columns(bytes_of(&delta(points)), PACKED, false, &mut raw);
         columns(bytes_of(details), DETAIL, true, &mut raw);
-        let z = zstd::bulk::compress(&raw, 3).ok()?;
+        let z = zstd::bulk::compress(&raw, level).ok()?;
         Some(Cold { z: z.into_boxed_slice(), points: points.len() as u32, details: details.len() as u32, first: points[0].t(), last })
     }
 
@@ -344,12 +354,9 @@ impl Cold {
 impl Trace {
     /// A trace of `points`, all packed away.
     pub fn restored(points: &[Packed], written: usize) -> Trace {
-        let mut t = Trace { written, ..Default::default() };
-        for c in points.chunks(OPEN_MAX - OPEN_KEEP) {
-            t.points.extend_from_slice(c);
-            t.compact(0);
-        }
-        t
+        let mut cold: Vec<Cold> = points.chunks(OPEN_MAX - OPEN_KEEP).filter_map(|c| Cold::pack(c, &[], LEVEL_FAST)).collect();
+        cold.shrink_to_fit();
+        Trace { written, cold, tail: points.last().map(|p| Box::new((*p, None))), ..Default::default() }
     }
 
     pub fn len(&self) -> usize {
@@ -432,7 +439,7 @@ impl Trace {
             Some(first_open) => self.details.partition_point(|x| x.t < first_open.t()),
             None => self.details.len(),
         };
-        let Some(cold) = Cold::pack(&self.points[..n], &self.details[..nd]) else { return };
+        let Some(cold) = Cold::pack(&self.points[..n], &self.details[..nd], LEVEL) else { return };
         let last_detail = self.details[..nd].last().copied().or_else(|| self.tail.as_ref().and_then(|t| t.1));
         let tail = (self.points[n - 1], last_detail);
         match &mut self.tail {
@@ -478,6 +485,144 @@ impl Trace {
         }
         self.written = self.written.saturating_sub(n);
         n
+    }
+}
+
+/// A trace in the state file is its chunks as they are held in memory,
+/// so saving compresses nothing again and restoring unpacks nothing:
+///
+/// ```text
+/// u32 newest points not yet in a history file
+/// u32 chunks    u8 1 if the open points follow them as one more chunk
+/// per chunk: u32 points, u32 details, u64 first, u64 last (ms), u32 bytes, the bytes
+/// u8 what follows: 1 the last point (24 bytes), 2 the last detail too (72 bytes)
+/// ```
+///
+/// all little-endian. A chunk's bytes are `Cold::pack`'s: whoever changes
+/// that, `Packed` or `Detail` gives the state file a new magic.
+pub struct Saved {
+    pub trace: Trace,
+    /// its last chunk was the points open when it was saved
+    pub open: bool,
+    /// newest points not yet in a history file
+    pub behind: usize,
+    /// time of the last point in a chunk packed for good (0: none), the
+    /// open points apart
+    pub until: Ms,
+}
+
+impl Trace {
+    /// Time of the last point packed away for good; 0 if none is.
+    pub fn packed_until(&self) -> Ms {
+        self.cold.last().map_or(0, |c| c.last)
+    }
+
+    /// The newest points not yet in a history file. (Counted from the
+    /// end, the number holds when old points are dropped from the front.)
+    pub fn behind(&self) -> usize {
+        self.len().saturating_sub(self.written)
+    }
+
+    /// Append to `out` what the trace holds after `after`: the chunks
+    /// packed since, and the open points as one more; all of it with 0.
+    /// The trace itself stays as it is.
+    pub fn save(&self, after: Ms, out: &mut Vec<u8>) {
+        let open = Cold::pack(&self.points, &self.details, LEVEL_FAST);
+        let cold = &self.cold[self.cold.partition_point(|c| c.last <= after)..];
+        out.extend_from_slice(&(self.behind() as u32).to_le_bytes());
+        out.extend_from_slice(&(cold.len() as u32).to_le_bytes());
+        out.push(open.is_some() as u8);
+        for c in cold.iter().chain(open.iter()) {
+            out.extend_from_slice(&c.points.to_le_bytes());
+            out.extend_from_slice(&c.details.to_le_bytes());
+            out.extend_from_slice(&c.first.to_le_bytes());
+            out.extend_from_slice(&c.last.to_le_bytes());
+            out.extend_from_slice(&(c.z.len() as u32).to_le_bytes());
+            out.extend_from_slice(&c.z);
+        }
+        match (self.last_point(), self.last_detail()) {
+            (Some(p), Some(d)) => {
+                out.push(2);
+                out.extend_from_slice(bytes_of(&[p]));
+                out.extend_from_slice(bytes_of(&[d]));
+            }
+            (Some(p), None) => {
+                out.push(1);
+                out.extend_from_slice(bytes_of(&[p]));
+            }
+            (None, _) => out.push(0),
+        }
+    }
+
+    /// Read back what `save` wrote, moving `b` past it. `None` if the
+    /// bytes are not a trace; a chunk is checked by its size only, not
+    /// unpacked (the file carries a checksum for the rest).
+    pub fn load(b: &mut &[u8]) -> Option<Saved> {
+        fn take<'a>(b: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
+            if b.len() < n {
+                return None;
+            }
+            let (head, rest) = b.split_at(n);
+            *b = rest;
+            Some(head)
+        }
+        fn u32_(b: &mut &[u8]) -> Option<u32> {
+            Some(u32::from_le_bytes(take(b, 4)?.try_into().ok()?))
+        }
+        fn u64_(b: &mut &[u8]) -> Option<u64> {
+            Some(u64::from_le_bytes(take(b, 8)?.try_into().ok()?))
+        }
+        let behind = u32_(b)? as usize;
+        let chunks = u32_(b)? as usize;
+        let open = match take(b, 1)?[0] {
+            0 => false,
+            1 => true,
+            _ => return None,
+        };
+        // (a chunk takes 28 bytes at least: a count that cannot be true
+        // must not reserve memory)
+        let mut cold: Vec<Cold> = Vec::with_capacity((chunks + open as usize).min(b.len() / 28));
+        for _ in 0..chunks + open as usize {
+            let (points, details, first, last) = (u32_(b)?, u32_(b)?, u64_(b)?, u64_(b)?);
+            let n = u32_(b)? as usize;
+            let z = take(b, n)?;
+            let size = points as u64 * PACKED as u64 + details as u64 * DETAIL as u64;
+            let follows = cold.last().map_or(true, |c| c.last < first);
+            if points == 0 || first > last || !follows || zstd::zstd_safe::get_frame_content_size(z).ok().flatten() != Some(size) {
+                return None;
+            }
+            cold.push(Cold { z: z.into(), points, details, first, last });
+        }
+        let tail = match take(b, 1)?[0] {
+            0 => None,
+            1 => Some(Box::new((from_bytes::<Packed>(take(b, PACKED)?)[0], None))),
+            2 => Some(Box::new((from_bytes::<Packed>(take(b, PACKED)?)[0], Some(from_bytes::<Detail>(take(b, DETAIL)?)[0])))),
+            _ => return None,
+        };
+        // what was saved had a last point, and its chunks end with it
+        if cold.last().map_or(0, |c| c.last) > tail.as_ref()?.0.t() {
+            return None;
+        }
+        let until = cold.iter().rev().nth(open as usize).map_or(0, |c| c.last);
+        let mut trace = Trace { points: Vec::new(), details: Vec::new(), written: 0, cold, tail, files: None };
+        trace.written = trace.len().saturating_sub(behind);
+        Some(Saved { trace, open, behind, until })
+    }
+
+    /// Bring a trace saved whole up to date with what a later
+    /// `save(after)` of it added: `was_open` says its own last chunk was
+    /// the points then open, which the newer chunks contain.
+    pub fn extend(&mut self, was_open: bool, newer: Saved) {
+        if was_open && !newer.trace.cold.is_empty() {
+            self.cold.pop();
+        }
+        // (a file put together from two that do not belong together must
+        // not give a trace that runs backwards)
+        let until = self.packed_until();
+        self.cold.extend(newer.trace.cold.into_iter().filter(|c| c.first > until));
+        self.cold.shrink_to_fit();
+        self.tail = newer.trace.tail;
+        self.written = self.len().saturating_sub(newer.behind);
     }
 }
 
