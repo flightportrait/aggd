@@ -377,6 +377,11 @@ On the recorded traffic, in rough order of how often:
   the second alone. When the first stops, readsb shows the second 8 to
   45 s later and aggd 10 to 26 s; at 60 km and at 9,000 km apart readsb
   takes about 40 s whatever the message rate, by a rule not found.
+- The `box` and `circle` queries, asked of both on live traffic twelve
+  times: the same aircraft, but for one whose position was 59.9 s old
+  in readsb's answer and gone from aggd's, and one aggd had first
+  placed 0.3 s before. An aircraft or two more or fewer at any moment
+  is the two not answering at the same instant.
 - An aircraft placed by a BaseStation feed and heard directly as well
   (`tools/sbs_src_probe.py`): version, accuracy figures and kind change
   at the same moments in both; a new aircraft is shown a second or two
